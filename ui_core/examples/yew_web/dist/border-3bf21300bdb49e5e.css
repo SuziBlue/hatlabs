@@ -1,0 +1,20 @@
+
+.border-thin {
+    border: 1px solid black;
+    padding: 0.5rem;
+}
+
+.border-thick {
+    border: 4px solid black;
+    padding: 0.5rem;
+}
+
+.border-double {
+    border: 3px double black;
+    padding: 0.5rem;
+}
+
+.border-double-thick {
+    border: 6px double black;
+    padding: 0.5rem;
+}

@@ -1,0 +1,15 @@
+# SoundboardCreateRequest
+
+## Properties
+
+Name | Type | Description | Notes
+------------ | ------------- | ------------- | -------------
+**name** | **String** |  | 
+**volume** | Option<**f64**> |  | [optional]
+**emoji_id** | Option<**String**> |  | [optional]
+**emoji_name** | Option<**String**> |  | [optional]
+**sound** | **String** |  | 
+
+[[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
+
+

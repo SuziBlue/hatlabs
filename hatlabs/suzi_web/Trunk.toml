@@ -1,0 +1,4 @@
+[serve]
+
+[[serve.static_dirs]]
+source = "static"

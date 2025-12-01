@@ -1,0 +1,20 @@
+cargo-features = ["edition2024"]
+
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.29"
+
+[build-dependencies]
+spirv-builder = "0.9"
+
+# Compile build-dependencies in release mode with
+# the same settings as regular dependencies.
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 16
+[profile.dev.build-override]
+opt-level = 3

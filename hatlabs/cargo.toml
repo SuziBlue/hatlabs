@@ -1,0 +1,6 @@
+
+[workspace]
+members = [
+    "suzi_web",
+    "suzi_backend"
+]

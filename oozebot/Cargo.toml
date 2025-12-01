@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/oozebot-core",
+    "crates/oozebot-protocol"
+]
+exclude = [
+    "openapi"
+]
+
+
+[package]
+name = "oozebot"
+version = "0.1.0"
+edition = "2024"
+

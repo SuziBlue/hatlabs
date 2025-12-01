@@ -1,0 +1,18 @@
+
+/* Warm Theme - Light and Dark modes */
+
+.theme-warm-light {
+    --bg-color: #fff8f0;
+    --text-color: #4a2c00;
+    --accent-color: #ff6600;
+    --accent-color-hover: #cc5200;
+    --slide-bg: #fff0e6;
+}
+
+.theme-warm-dark {
+    --bg-color: #3b1f00;
+    --text-color: #ffddb3;
+    --accent-color: #ff8533;
+    --accent-color-hover: #ffaa66;
+    --slide-bg: #2a1500;
+}

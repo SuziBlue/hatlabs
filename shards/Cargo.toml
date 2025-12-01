@@ -1,0 +1,9 @@
+[package]
+name = "shards"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-channel = "0.5.15"
+paste = "1.0.15"
+typed-builder = "0.21.0"

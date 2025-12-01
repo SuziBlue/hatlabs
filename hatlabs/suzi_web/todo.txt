@@ -1,0 +1,27 @@
+Suziblue's amazing website
+  - Homepage (lore)
+  - Schedule Page
+  - Shop Page
+  - Gallery
+  - Blog
+  - Random hat insult
+  - FAQ
+  - Social media links
+  - Autoclicker minigame
+
+Theme
+  - Gloomy and gothic aesthetic
+  - Blue and purple
+  - Sparkling potions
+  - Animated slime cursor
+
+Logo
+  - Tired squishy version of Suziblue sitting on a spellbook with hat looking smug.
+
+Technical
+  - Yew (Rust library for making html webpages)
+  - Pull stream schedule from YouTube automatically
+  - Fill shop with "coming soon" items
+  - Display images in the Gallery
+  - Let Suzi post on the Blog page
+  - Display random hat insults when pressing a button

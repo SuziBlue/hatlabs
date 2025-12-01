@@ -1,0 +1,213 @@
+
+@import "styles/colors/default.css";
+@import "styles/colors/warm.css";
+@import "styles/colors/calm.css";
+
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    font-family: var(--font-family, system-ui, sans-serif);
+}
+
+.slide-wrapper {
+    position: relative;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+}
+
+/* Base slide style */
+.slide {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    padding: 2em;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    background-color: var(--slide-bg);
+    color: var(--text-color);
+    transition: transform 0.6s ease, opacity 0.6s ease;
+}
+
+/* Slide-in animations */
+.enter-right {
+    transform: translateX(100%);
+    opacity: 1;
+    animation: slide-in-right 0.6s forwards;
+}
+
+.enter-left {
+    transform: translateX(-100%);
+    opacity: 1;
+    animation: slide-in-left 0.6s forwards;
+}
+
+/* Slide-out animations */
+.exit-left {
+    transform: translateX(0%);
+    opacity: 1;
+    animation: slide-out-left 0.6s forwards;
+}
+
+.exit-right {
+    transform: translateX(0%);
+    opacity: 1;
+    animation: slide-out-right 0.6s forwards;
+}
+
+/* Keyframes */
+@keyframes slide-in-right {
+    to {
+        transform: translateX(0%);
+        opacity: 1;
+    }
+}
+
+@keyframes slide-in-left {
+    to {
+        transform: translateX(0%);
+        opacity: 1;
+    }
+}
+
+@keyframes slide-out-left {
+    to {
+        transform: translateX(-100%);
+        opacity: 1;
+    }
+}
+
+@keyframes slide-out-right {
+    to {
+        transform: translateX(100%);
+        opacity: 1;
+    }
+}
+
+.nav-container {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 15%;
+    pointer-events: none;
+}
+
+.nav-container.left {
+    left: 0;
+}
+
+.nav-container.right {
+    right: 0;
+}
+
+.nav-button {
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    background: var(--accent-color);
+    color: var(--bg-color);
+    border: none;
+    padding: 1em;
+    font-size: 1.5em;
+    cursor: pointer;
+    z-index: 10;
+    pointer-events: auto;
+    border-radius: 8px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+
+.edge-hover {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: transparent;
+    transition: background-color 0.3s ease;
+    cursor: pointer;
+}
+
+.edge-hover:hover {
+    background-color: rgba(0, 0, 0, 0.1); /* 10% black */
+}
+
+.nav-container.left .edge-hover:hover {
+    background: linear-gradient(to right, rgba(0, 0, 0, 0.3), transparent);
+}
+
+.nav-container.right .edge-hover:hover {
+    background: linear-gradient(to left, rgba(0, 0, 0, 0.3), transparent);
+}
+
+.edge-hover:hover .nav-button {
+    opacity: 1;
+}
+
+
+.hover-zone {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100vw;
+    height: 40px;
+    z-index: 1000;
+    background: transparent;
+    pointer-events: auto;
+}
+
+.mode-toggle-container {
+    position: fixed;
+    bottom: 0;
+    right: 1rem;
+    /* Remove padding, background, border-radius, box-shadow */
+    padding: 0;
+    background: transparent;
+    border-radius: 0;
+    box-shadow: none;
+
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+    z-index: 1001;
+}
+
+.hover-zone:hover + .mode-toggle-container {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.mode-toggle-container button {
+    all: unset; /* reset */
+    cursor: pointer;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background-color: var(--accent-color);
+    color: var(--bg-color);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    transition: background-color 0.3s ease;
+}
+
+.mode-toggle-container button:hover {
+    background-color: var(--accent-color-hover, #005f99);
+}
+
+.mode-toggle-container svg {
+    stroke: currentColor;
+    width: 24px;
+    height: 24px;
+}

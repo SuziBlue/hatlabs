@@ -1,0 +1,24 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<base data-trunk-public-url="/" />
+<html>
+  <head>
+    <link rel="stylesheet" href="/style-b292ab8c8e971fe3.css" integrity="sha384-70RWzrgqP9v3k2rG067p/iqjUt5JvvsADQj/8X+w7/ea4aB4iDcMoJZAH+sKFLL/"/>
+    <meta charset="utf-8" />
+    <title>My Yew App</title>
+  <link rel="modulepreload" href="/suzi_web-c13add21aa85514e.js" crossorigin="anonymous" integrity="sha384-ofy1LfCG9QZN9cSFa4UdI3tlDbzwCI2H0r4H1+mms10jVdQ07FXvGnzQW+GrZ2Lw"><link rel="preload" href="/suzi_web-c13add21aa85514e_bg.wasm" crossorigin="anonymous" integrity="sha384-jokkxZuwyiD0mABweWVPA3HdJUA8V7Sz7epg5WAzzdOUTL9MEWm1+0EHFPMZJjkd" as="fetch" type="application/wasm"></head>
+  <body>
+    <main></main>
+  
+<script type="module">
+import init, * as bindings from '/suzi_web-c13add21aa85514e.js';
+const wasm = await init({ module_or_path: '/suzi_web-c13add21aa85514e_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script></body>
+</html>

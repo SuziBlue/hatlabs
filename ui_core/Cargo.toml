@@ -1,0 +1,16 @@
+[package]
+name = "ui_core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+
+[dependencies]
+leylines = { path = "../leylines" }
+
+[workspace]
+members = [
+  "examples/yew_web",
+  "examples/basic", 
+  "examples/ratatui_impl", "examples/wasm",
+]

@@ -1,0 +1,18 @@
+
+/* Calm Theme - Light and Dark modes */
+
+.theme-calm-light {
+    --bg-color: #f0faf0;
+    --text-color: #225522;
+    --accent-color: #339933;
+    --accent-color-hover: #227722;
+    --slide-bg: #e6f2e6;
+}
+
+.theme-calm-dark {
+    --bg-color: #123312;
+    --text-color: #a3dca3;
+    --accent-color: #55bb55;
+    --accent-color-hover: #77dd77;
+    --slide-bg: #0d220d;
+}

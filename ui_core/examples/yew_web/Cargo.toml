@@ -1,0 +1,11 @@
+[package]
+name = "yew_web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+yew = { version = "0.21.0", features = ["csr"] }
+
+ui_core = { path = "../..", features = [] }
+web-sys = "0.3.77"
+gloo = "0.11.0"
