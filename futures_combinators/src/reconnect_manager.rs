@@ -35,6 +35,19 @@ pin_project! {
     }
 }
 
+impl<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> {
+    pub fn new(inner: Inner, on_send: SendFn, on_recv: RecvFn) -> Self {
+        Self { 
+            inner: Some(inner), 
+            on_send, 
+            send_future: None, 
+            send_queue: VecDeque::new(), 
+            on_recv, 
+            recv_future: None 
+        }
+    }
+}
+
 impl<Inner, Item, E, SendFn, SendFut, RecvFn, RecvFut> Stream for ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> 
 where 
     Inner: Sink<Item> + Stream,

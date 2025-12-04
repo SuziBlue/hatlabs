@@ -1,8 +1,16 @@
 use serde::Serialize;
+use tokio_tungstenite::tungstenite::{self, Utf8Bytes};
 
 impl From<Heartbeat> for GatewaySendEvent {
     fn from(value: Heartbeat) -> Self {
         GatewaySendEvent::Heartbeat(value)
+    }
+}
+
+impl From<GatewaySendEvent> for tungstenite::Message {
+    fn from(value: GatewaySendEvent) -> Self {
+        let text = serde_json::to_string(&value).expect("Should be serializable");
+        tungstenite::Message::text(text)
     }
 }
 

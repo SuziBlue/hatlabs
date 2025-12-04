@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::{self, Utf8Bytes};
 
 use crate::{opcodes::GatewayOpCode, GatewayError, RawGatewayPayload};
 
@@ -10,6 +11,14 @@ impl From<GatewayRecvEvent> for Option<HeartbeatAck> {
             GatewayRecvEvent::HeartbeatAck(ack) => Some(ack),
             _ => None,
         }
+    }
+}
+
+impl TryFrom<Utf8Bytes> for GatewayRecvEvent {
+    type Error = serde_json::Error;
+
+    fn try_from(value: Utf8Bytes) -> Result<Self, Self::Error> {
+        serde_json::from_str(value.as_str())
     }
 }
 

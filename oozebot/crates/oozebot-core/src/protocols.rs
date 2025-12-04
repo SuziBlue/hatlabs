@@ -1,9 +1,168 @@
 
 use std::{task::Poll, time::Duration};
 
-use futures::Stream;
+use futures::future::Either;
+use futures::{Sink, SinkExt, Stream, StreamExt};
+use oozebot_protocol::close_codes::GatewayCloseCode;
+use oozebot_protocol::events::receive::{self, GatewayRecvEvent};
+use oozebot_protocol::events::send::{self, GatewaySendEvent};
 use pin_project_lite::pin_project;
 use tokio::time::{interval, Interval};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+use crate::streams::{ReconnectManager, StreamExtSplit};
+
+
+
+impl From<receive::Heartbeat> for Heartbeat {
+    fn from(_value: receive::Heartbeat) -> Self {
+        Heartbeat {  }
+    }
+}
+
+impl From<receive::Heartbeat> for HeartbeatManagerInput {
+    fn from(value: receive::Heartbeat) -> Self {
+        HeartbeatManagerInput::Heartbeat(value.into())
+    }
+}
+
+impl From<receive::HeartbeatAck> for HeartbeatAck {
+    fn from(_value: receive::HeartbeatAck) -> Self {
+        HeartbeatAck {  }
+    }
+}
+
+impl From<receive::HeartbeatAck> for HeartbeatManagerInput {
+    fn from(value: receive::HeartbeatAck) -> Self {
+        HeartbeatManagerInput::HeartbeatAck(value.into())
+    }
+}
+
+pub async fn create_connection(url: &str) -> impl Sink<GatewaySendEvent> + Stream {
+    let (mut ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let hello = match ws_connection.next().await
+        .expect("Websocket should not close")
+        .expect("Websocket should not error")
+        .into_text()
+        .expect("Message should be json")
+        .try_into()
+        .expect("Message should be deserializable") {
+            GatewayRecvEvent::Hello(h) => h,
+            _ => panic!("Received a gateway event other than Hello")
+        };
+    let heartbeat_interval = hello.heartbeat_interval;
+
+    let (outgoing, incoming) = ws_connection.split();
+
+    let (other, heartbeat_events) = incoming
+        .map(|item| {
+            match item {
+                Ok(Message::Text(text)) => {
+                    let event = TryInto::<GatewayRecvEvent>::try_into(text).expect("Could not deserialize text");
+                    Ok(event)
+                },
+                Ok(_) => panic!("Received an unknown message type"),
+                Err(e) => Err(e),
+            }
+        })
+        .map(|item| {
+            match item {
+                Ok(GatewayRecvEvent::Heartbeat(event)) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
+                Ok(GatewayRecvEvent::HeartbeatAck(event)) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
+                res => Either::Left(res),
+            }
+        })
+        .split_either();
+
+    let heartbeat_manager = HeartbeatManager::new(heartbeat_events, Duration::from_millis(heartbeat_interval));
+
+    let (heartbeat_errors, heartbeats) = heartbeat_manager.map(|item| {
+        match item {
+            Ok(heartbeat) => Either::Right(heartbeat),
+            Err(error) => Either::Left(error),
+        }
+    })
+    .split_either();
+
+    todo!();
+}
+
+pub fn should_reconnect(close_frame: Option<CloseFrame>) -> bool {
+    if close_frame.is_none() {
+        return true
+    }
+    if let Ok(close_code) = GatewayCloseCode::try_from(close_frame.expect("Close frame is not None").code) {
+        return close_code.can_reconnect()
+    } else {
+        return false
+    }
+}
+
+pub async fn resume_connection(token: &str, session_id: &str, resume_gateway_url: &str, sequence_number: u64) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ()> {
+    let (mut inner, _response) = tokio_tungstenite::connect_async(resume_gateway_url).await.unwrap();
+
+    let resume_event = GatewaySendEvent::Resume(
+        send::Resume { 
+            token: token.to_string(), 
+            session_id: session_id.to_string(), 
+            seq: sequence_number 
+        }
+    );
+
+    inner.send(resume_event.into()).await.unwrap();
+
+    Ok(inner)
+}
+
+pub async fn connect_websocket(url: &str) -> impl Sink<Message> + Stream
+{
+
+    let (inner, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let on_send = |mut inner: WebSocketStream<MaybeTlsStream<TcpStream>>, item: Message| async {
+        match inner.send(item).await {
+            Ok(_) => return Ok(inner),
+            Err(e) => return  Err(e),
+        }
+    };
+
+
+    let url_clone = url.clone();
+
+    let on_recv = move |mut inner: WebSocketStream<MaybeTlsStream<TcpStream>>| {
+        async move {
+            while let Some(res) = inner.next().await {
+                match res {
+                    Ok(Message::Close(maybe_closeframe)) => {
+                        if should_reconnect(maybe_closeframe) {
+                            let new_inner = resume_connection().await;
+                            inner = new_inner;
+                            continue
+                        } else {
+                            return None;
+                        }
+                    }
+                    Ok(msg) => return Some((inner, msg)),
+                    Err(_e) => {
+                        return None;
+                    }
+                }
+            };
+
+            return None
+        }
+    };
+
+
+    ReconnectManager::new(inner, on_send, on_recv)
+}
+
+
+
 
 
 #[derive(Debug)]
@@ -46,9 +205,10 @@ impl<S> HeartbeatManager<S> {
     }
 }
 
-impl<S> Stream for HeartbeatManager<S> 
+impl<S, Item> Stream for HeartbeatManager<S> 
 where 
-    S: Stream<Item = HeartbeatManagerInput>,
+    S: Stream<Item = Item>,
+    Item: Into<HeartbeatManagerInput>,
 {
     type Item = Result<Heartbeat, HeartbeatError>;
 
@@ -58,15 +218,19 @@ where
         loop {
             match this.incoming.as_mut().poll_next(cx) {
                 Poll::Pending => break,
-                Poll::Ready(Some(HeartbeatManagerInput::HeartbeatAck(_ack))) => {
-                    *this.ack_received = true;
-                    continue
-                },
-                Poll::Ready(Some(HeartbeatManagerInput::Heartbeat(_heartbeat))) => {
-                    *this.ack_received = false;
-                    this.interval.reset();
-                    return Poll::Ready(Some(Ok(Heartbeat {  })))
-                },
+                Poll::Ready(Some(item)) => {
+                    match item.into() {
+                        HeartbeatManagerInput::HeartbeatAck(_ack) => {
+                            *this.ack_received = true;
+                            continue
+                        },
+                        HeartbeatManagerInput::Heartbeat(_heartbeat) => {
+                            *this.ack_received = false;
+                            this.interval.reset();
+                            return Poll::Ready(Some(Ok(Heartbeat {  })))
+                        },
+                    }
+                }
                 Poll::Ready(None) => return Poll::Ready(None),
             };
         }
@@ -74,11 +238,11 @@ where
         match this.interval.poll_tick(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(_instant) => {
-                if !*this.ack_received {
-                    return Poll::Ready(Some(Err(HeartbeatError {})))
-                } else {
+                if *this.ack_received {
                     *this.ack_received = false;
                     return Poll::Ready(Some(Ok(Heartbeat {})))
+                } else {
+                    return Poll::Ready(Some(Err(HeartbeatError {})))
                 }
             }
         };

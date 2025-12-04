@@ -1,5 +1,6 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 
 /// Discord Gateway Close Codes
@@ -73,6 +74,17 @@ impl From<u16> for GatewayCloseCode {
             4013 => GatewayCloseCode::InvalidIntents,
             4014 => GatewayCloseCode::DisallowedIntents,
             other => GatewayCloseCode::Unknown(other),
+        }
+    }
+}
+
+impl TryFrom<CloseCode> for GatewayCloseCode {
+    type Error = ();
+
+    fn try_from(value: CloseCode) -> Result<Self, Self::Error> {
+        match value {
+            CloseCode::Library(code) => Ok(code.into()),
+            _ => Err(()),
         }
     }
 }
