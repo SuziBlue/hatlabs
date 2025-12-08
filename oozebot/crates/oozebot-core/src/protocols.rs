@@ -1,16 +1,16 @@
 
 use std::{task::Poll, time::Duration};
 
-use futures::future::Either;
+use futures::future::{select, Either, Map};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use oozebot_protocol::close_codes::GatewayCloseCode;
-use oozebot_protocol::events::receive::{self, GatewayRecvEvent};
+use oozebot_protocol::events::receive::{self, GatewayCloseEvent, GatewayIncoming, GatewayRecvEvent};
 use oozebot_protocol::events::send::{self, GatewaySendEvent};
 use pin_project_lite::pin_project;
 use tokio::time::{interval, Interval};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::streams::{ReconnectManager, StreamExtSplit};
@@ -41,38 +41,67 @@ impl From<receive::HeartbeatAck> for HeartbeatManagerInput {
     }
 }
 
-pub async fn create_connection(url: &str) -> impl Sink<GatewaySendEvent> + Stream {
-    let (mut ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
+#[derive(Debug)]
+pub enum GatewayError {
+    SerdeError(serde_json::Error),
+    WebSocketError(tungstenite::Error),
+    HeartbeatError(HeartbeatError),
+}
 
-    let hello = match ws_connection.next().await
-        .expect("Websocket should not close")
-        .expect("Websocket should not error")
-        .into_text()
-        .expect("Message should be json")
-        .try_into()
-        .expect("Message should be deserializable") {
-            GatewayRecvEvent::Hello(h) => h,
-            _ => panic!("Received a gateway event other than Hello")
-        };
-    let heartbeat_interval = hello.heartbeat_interval;
+impl From<serde_json::Error> for GatewayError {
+    fn from(value: serde_json::Error) -> Self {
+        GatewayError::SerdeError(value)
+    }
+}
+
+impl From<tungstenite::Error> for GatewayError {
+    fn from(value: tungstenite::Error) -> Self {
+        GatewayError::WebSocketError(value)
+    }
+}
+
+pub async fn create_connection(url: &str) {
+    let (ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let (outgoing, incoming) = ws_connection.split();
 
-    let (other, heartbeat_events) = incoming
+    let mut decoded = incoming.map(|msg| {
+        match msg {
+            Ok(Message::Text(text)) => {
+                match TryInto::<GatewayRecvEvent>::try_into(text) {
+                    Ok(event) => return Ok(GatewayIncoming::Recv(event)),
+                    Err(e) => return Err(Into::<GatewayError>::into(e))
+                }
+            },
+            Ok(Message::Close(maybe_frame)) => {
+                let close_event = Into::<GatewayCloseEvent>::into(maybe_frame);
+                return Ok(GatewayIncoming::Close(close_event))
+            },
+            Ok(_) => {panic!("Received an unexpected message type from Discord gateway")},
+            Err(e) => return Err(Into::<GatewayError>::into(e))
+        };
+    });
+
+    let encoded = outgoing.with(|item: GatewaySendEvent| async {
+        Ok::<tungstenite::Message, GatewayError>(Into::<Message>::into(item))
+    });
+
+    let hello = match decoded.next().await
+        .expect("Websocket should not close")
+        .expect("Websocket should not error")
+        {
+            GatewayIncoming::Recv(GatewayRecvEvent::Hello(h)) => h,
+            GatewayIncoming::Recv(_) => panic!("Received a gateway event other than Hello"),
+            GatewayIncoming::Close(c) => panic!("Gateway closed immediately: {:?}", c)
+        };
+    let heartbeat_interval = hello.heartbeat_interval;
+
+
+    let (other, heartbeat_events) = decoded
         .map(|item| {
             match item {
-                Ok(Message::Text(text)) => {
-                    let event = TryInto::<GatewayRecvEvent>::try_into(text).expect("Could not deserialize text");
-                    Ok(event)
-                },
-                Ok(_) => panic!("Received an unknown message type"),
-                Err(e) => Err(e),
-            }
-        })
-        .map(|item| {
-            match item {
-                Ok(GatewayRecvEvent::Heartbeat(event)) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
-                Ok(GatewayRecvEvent::HeartbeatAck(event)) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
+                Ok(GatewayIncoming::Recv(GatewayRecvEvent::Heartbeat(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
+                Ok(GatewayIncoming::Recv(GatewayRecvEvent::HeartbeatAck(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
                 res => Either::Left(res),
             }
         })
@@ -87,6 +116,10 @@ pub async fn create_connection(url: &str) -> impl Sink<GatewaySendEvent> + Strea
         }
     })
     .split_either();
+
+    let final_stream = futures::stream::select(other, heartbeat_errors.map(|e| Err(GatewayError::HeartbeatError(e))));
+
+    let final_sink = /// TODO: fan-in sink to send heartbeats through the websocket
 
     todo!();
 }

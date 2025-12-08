@@ -323,7 +323,7 @@ where
 
 pub trait StreamExtSplit: Stream + Sized {
 
-    fn split_either<L, R, S>(mut self) -> (ReceiverStream<L>, ReceiverStream<R>) 
+    fn split_either<L, R>(mut self) -> (ReceiverStream<L>, ReceiverStream<R>) 
     where 
         Self: Stream<Item = Either<L, R>> + Unpin + Send + 'static,
         L: Unpin + Send + 'static,

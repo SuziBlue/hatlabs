@@ -1,10 +1,12 @@
 
+use std::u16;
+
 use serde::{Deserialize, Deserializer, Serialize};
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 
 
 /// Discord Gateway Close Codes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Serialize)]
 #[repr(u16)]
 pub enum GatewayCloseCode {
     /// Unknown error — We're not sure what went wrong. Try reconnecting? (Reconnect: true)
@@ -37,6 +39,7 @@ pub enum GatewayCloseCode {
     DisallowedIntents = 4014,
     /// An unknown or undocumented close code.
     Unknown(u16),
+    None,
 }
 
 impl GatewayCloseCode {
@@ -52,6 +55,7 @@ impl GatewayCloseCode {
                 | GatewayCloseCode::InvalidSeq
                 | GatewayCloseCode::RateLimited
                 | GatewayCloseCode::SessionTimedOut
+                | GatewayCloseCode::None
         )
     }
 }
@@ -78,16 +82,14 @@ impl From<u16> for GatewayCloseCode {
     }
 }
 
-impl TryFrom<CloseCode> for GatewayCloseCode {
-    type Error = ();
-
-    fn try_from(value: CloseCode) -> Result<Self, Self::Error> {
-        match value {
-            CloseCode::Library(code) => Ok(code.into()),
-            _ => Err(()),
-        }
+impl From<CloseCode> for GatewayCloseCode {
+    fn from(value: CloseCode) -> Self {
+        let code = value.into();
+        From::<u16>::from(code)
     }
 }
+
+
 
 impl<'de> Deserialize<'de> for GatewayCloseCode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

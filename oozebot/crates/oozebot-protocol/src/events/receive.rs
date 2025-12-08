@@ -1,8 +1,8 @@
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use tokio_tungstenite::tungstenite::{self, Utf8Bytes};
+use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Utf8Bytes};
 
-use crate::{opcodes::GatewayOpCode, GatewayError, RawGatewayPayload};
+use crate::{close_codes::GatewayCloseCode, opcodes::GatewayOpCode, GatewayError, RawGatewayPayload};
 
 
 impl From<GatewayRecvEvent> for Option<HeartbeatAck> {
@@ -20,6 +20,27 @@ impl TryFrom<Utf8Bytes> for GatewayRecvEvent {
     fn try_from(value: Utf8Bytes) -> Result<Self, Self::Error> {
         serde_json::from_str(value.as_str())
     }
+}
+
+impl From<Option<CloseFrame>> for GatewayCloseEvent {
+    fn from(value: Option<CloseFrame>) -> Self {
+        match value {
+            Some(close_frame) => GatewayCloseEvent { close_code: close_frame.code.into(), reason: close_frame.reason.to_string() },
+            None => GatewayCloseEvent { close_code: GatewayCloseCode::None, reason: "".to_string() }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
+pub enum GatewayIncoming {
+    Recv(GatewayRecvEvent),
+    Close(GatewayCloseEvent),
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
+pub struct GatewayCloseEvent {
+    close_code: GatewayCloseCode,
+    reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
