@@ -39,11 +39,11 @@ pub enum GatewayIncoming {
 
 #[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
 pub struct GatewayCloseEvent {
-    close_code: GatewayCloseCode,
-    reason: String,
+    pub close_code: GatewayCloseCode,
+    pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
 pub enum GatewayRecvEvent {
     Hello(Hello),
     HeartbeatAck(HeartbeatAck),
@@ -54,39 +54,35 @@ pub enum GatewayRecvEvent {
     InvalidSession(InvalidSession),
 }
 
-impl<'de> Deserialize<'de> for GatewayRecvEvent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = RawGatewayPayload::deserialize(deserializer)?;
+impl TryFrom<RawGatewayPayload> for GatewayRecvEvent {
+    type Error = GatewayError;
 
+    fn try_from(raw: RawGatewayPayload) -> Result<Self, Self::Error> {
+        
         let opcode = GatewayOpCode::try_from(raw.op)
-            .map_err(serde::de::Error::custom)?;
+            .map_err(|_e| GatewayError::InvalidOpCode(raw.op))?;
 
         match opcode {
             GatewayOpCode::Hello => {
                 serde_json::from_value(raw.d)
                     .map(GatewayRecvEvent::Hello)
-                    .map_err(serde::de::Error::custom)
+                    .map_err(|e| e.into())
             }
             GatewayOpCode::Heartbeat => {
                 serde_json::from_value(raw.d)
                     .map(GatewayRecvEvent::Heartbeat)
-                    .map_err(serde::de::Error::custom)
+                    .map_err(|e| e.into())
             }
-            GatewayOpCode::HeartbeatAck => Ok(GatewayRecvEvent::HeartbeatAck(
-                HeartbeatAck{
-                    sequence_number: raw.s.ok_or(serde::de::Error::custom("sequence number not found in HeartbeatAck"))?
-                }
-            )),
+            GatewayOpCode::HeartbeatAck => {
+                Ok(GatewayRecvEvent::HeartbeatAck(HeartbeatAck))
+            }
             GatewayOpCode::Reconnect => Ok(GatewayRecvEvent::Reconnect(Reconnect)),
             GatewayOpCode::InvalidSession => {
                 serde_json::from_value(raw.d)
                     .map(GatewayRecvEvent::InvalidSession)
-                    .map_err(serde::de::Error::custom)
+                    .map_err(|e| e.into())
             }
-            _ => Err(serde::de::Error::custom(GatewayError::InvalidOpCode(raw.op))),
+            _ => Err(GatewayError::InvalidOpCode(raw.op)),
         }
     }
 }
@@ -139,18 +135,8 @@ pub struct Guild {
     // Add other guild fields as needed
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-pub struct Dispatch {
-    pub op: u8,            // Should be 0
-    pub d: Value,          // Raw event payload (will depend on event type)
-    pub s: Option<u64>,    // Sequence number
-    pub t: Option<String>, // Event name, e.g. "MESSAGE_CREATE", "READY", etc.
-}
-
 #[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
-pub struct HeartbeatAck {
-    pub sequence_number: u64,
-}
+pub struct HeartbeatAck;
     
 #[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
 pub struct Reconnect;

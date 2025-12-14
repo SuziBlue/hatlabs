@@ -1,9 +1,9 @@
 
-use std::{cmp::{Ordering, Reverse}, collections::{BinaryHeap, HashSet, VecDeque}, fmt::Debug, marker::PhantomData, pin::Pin, task::Poll};
+use std::{cmp::{Ordering, Reverse}, collections::{BinaryHeap, HashSet, VecDeque}, fmt::Debug, marker::PhantomData, pin::Pin, sync::{atomic::AtomicUsize, Arc}, task::{ready, Poll}};
 
-use futures::{future::Either, stream::Peekable, FutureExt, Sink, Stream, StreamExt};
+use futures::{future::Either, lock::{Mutex, MutexGuard, MutexLockFuture, OwnedMutexGuard, OwnedMutexLockFuture}, stream::Peekable, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use pin_project_lite::pin_project;
-use tokio::{sync::mpsc::channel, time::{sleep_until, Sleep}, time::{Duration, Instant}};
+use tokio::{sync::mpsc::channel, time::{sleep_until, Duration, Instant, Sleep}};
 use tokio_stream::wrappers::ReceiverStream;
 
 
@@ -430,15 +430,13 @@ impl<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> ReconnectManager<Inner, Item
     }
 }
 
-impl<Inner, Item, E, SendFn, SendFut, RecvFn, RecvFut> Stream for ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> 
+impl<Inner, Item, GoodItem, SendFn, SendFut, RecvFn, RecvFut> Stream for ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> 
 where 
-    Inner: Sink<Item> + Stream,
-    SendFn: FnMut(Inner, Item) -> SendFut,
-    SendFut: Future<Output = Result<Inner, E>>,
+    Inner: Stream,
     RecvFn: FnMut(Inner) -> RecvFut,
-    RecvFut: Future<Output = Option<(Inner, Item)>>,
+    RecvFut: Future<Output = Option<(Inner, GoodItem)>>,
 {
-    type Item = Item;
+    type Item = GoodItem;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -472,11 +470,9 @@ where
 
 impl<Inner, Item, E, SendFn, SendFut, RecvFn, RecvFut> Sink<Item> for ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> 
 where 
-    Inner: Sink<Item> + Stream,
+    Inner: Sink<Item>,
     SendFn: FnMut(Inner, Item) -> SendFut,
     SendFut: Future<Output = Result<Inner, E>>,
-    RecvFn: FnMut(Inner) -> RecvFut,
-    RecvFut: Future<Output = Option<(Inner, Item)>>,
 {
     type Error = E;
 
@@ -692,6 +688,234 @@ where
     }
 }
 
+pin_project! {
+    pub struct Duplex<Si, St, Item> {
+        #[pin]
+        sink: Si,
+        #[pin]
+        stream: St,
+        _marker: PhantomData<Item>,
+    }
+}
+
+impl<Si, St, Item> Duplex<Si, St, Item> 
+where 
+    Si: Sink<Item>,
+    St: Stream,
+{
+    pub fn new(sink: Si, stream: St) -> Self {
+        Duplex { sink, stream, _marker: PhantomData }
+    }
+}
+
+impl<Si, St, Item> Sink<Item> for Duplex<Si, St, Item>
+where 
+    Si: Sink<Item>,
+{
+    type Error = Si::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().sink.poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
+        self.project().sink.start_send(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().sink.poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().sink.poll_close(cx)
+    }
+}
+
+impl<Si, St, Item> Stream for Duplex<Si, St, Item>
+where 
+    St: Stream,
+{
+    type Item = St::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().stream.poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+}
+
+enum FanInSinkState {
+    Open,
+    Closing,
+    Closed,
+}
+
+pin_project! {
+    pub struct FanInSink<Si, Item> 
+    {
+        inner_sink: Arc<Mutex<Si>>,
+        open_peers: AtomicUsize,
+        state: FanInSinkState,
+        #[pin]
+        lock: Option<Either<OwnedMutexLockFuture<Si>, OwnedMutexGuard<Si>>>,
+        _marker: PhantomData<Item>,
+    }
+}
+
+impl<Si, Item> FanInSink<Si, Item> 
+where 
+    Si: Sink<Item>
+{
+    pub fn new(sink: Si) -> Self {
+        FanInSink { 
+            inner_sink: Arc::new(Mutex::new(sink)), 
+            open_peers: AtomicUsize::new(1),
+            state: FanInSinkState::Open,
+            lock: None, 
+            _marker: PhantomData }
+    }
+
+    fn acquire_lock(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<OwnedMutexGuard<Si>> {
+        let mut this = self.project();
+
+        loop {
+            match this.lock.take() {
+                Some(Either::Left(mut fut)) => {
+                    match fut.poll_unpin(cx) {
+                        Poll::Pending => {
+                            *this.lock = Some(Either::Left(fut));
+                            return Poll::Pending
+                        }
+                        Poll::Ready(sink) => {
+                            *this.lock = Some(Either::Right(sink));
+                            continue
+                        },
+                    }
+                },
+                Some(Either::Right(sink)) => return Poll::Ready(sink),
+                None => {
+                    *this.lock = Some(Either::Left(this.inner_sink.clone().lock_owned()));
+                    continue
+                },
+            };
+        }
+    }
+
+    fn return_sink(self: Pin<&mut Self>, sink: OwnedMutexGuard<Si>) {
+        let mut this = self.project();
+
+        *this.lock = Some(Either::Right(sink));
+    }
+}
+
+impl<Si, Item> Clone for FanInSink<Si, Item> 
+{
+    fn clone(&self) -> Self {
+        let open_peers = self.open_peers.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+
+        FanInSink { 
+            inner_sink: self.inner_sink.clone(), 
+            open_peers: open_peers.into(),
+            state: FanInSinkState::Open,
+            lock: None, 
+            _marker: PhantomData }
+    }
+}
+
+impl<Si, Item> Sink<Item> for FanInSink<Si, Item> 
+where 
+    Si: Sink<Item> + Unpin
+{
+    type Error = Si::Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+
+        let mut sink = ready!(self.as_mut().acquire_lock(cx));
+        let poll = sink.poll_ready_unpin(cx);
+
+        self.return_sink(sink);
+
+        return poll
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
+        let mut this = self.project();
+
+        match this.lock.take() {
+            Some(Either::Right(mut sink)) => {
+                let res = sink.start_send_unpin(item);
+                *this.lock = Some(Either::Right(sink));
+                return res
+            }
+            _ => panic!("Should not call start_send before poll_ready")
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut this = self.project();
+
+        match this.lock.take() {
+            Some(Either::Right(mut sink)) => {
+                match sink.poll_flush_unpin(cx) {
+                    Poll::Pending => {
+                        *this.lock = Some(Either::Right(sink));
+                        return Poll::Pending
+                    }
+                    Poll::Ready(Ok(())) => {
+                        // Sink is finished flushing so drop the guard.
+                        drop(sink);
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e))
+                };
+            }
+            _ => panic!("Should not call poll_flush before poll_ready")
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+
+        loop {
+            match self.state {
+                FanInSinkState::Open => {
+                    self.state = FanInSinkState::Closing;
+                    if self.open_peers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) > 1 {
+                        *self.project().lock = None;
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                FanInSinkState::Closing => {
+                    let mut sink = ready!(self.as_mut().acquire_lock(cx));
+                    match sink.poll_close_unpin(cx) {
+                        Poll::Pending => {
+                            self.as_mut().return_sink(sink);
+                            return Poll::Pending;
+                        },
+                        Poll::Ready(Ok(())) => {
+                            self.state = FanInSinkState::Closed;
+                            return Poll::Ready(Ok(()))
+                        },
+                        Poll::Ready(Err(e)) => {
+                            self.state = FanInSinkState::Closed;
+                            return Poll::Ready(Err(e))
+                        }
+                    }
+                }
+                FanInSinkState::Closed => {
+                    return Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+}
+
+
+
+
+
+
 
 #[cfg(test)]
 mod tests{
@@ -703,7 +927,7 @@ mod tests{
     use tokio;
     use tokio_util::sync::PollSender;
 
-    use crate::reconnect_manager::{FailoverSink, ReconnectManager};
+    use crate::streams::{FailoverSink, ReconnectManager};
     #[tokio::test]
     async fn test_failover_sink() {
         let (tx1, mut rx1) = tokio::sync::mpsc::channel::<i32>(10);
@@ -816,10 +1040,10 @@ mod tests{
         assert_eq!(inner.sent, vec![1, 2]);
     }
 
-    use futures::{future::Either, stream::{self, Iter, StreamExt}};
+    use futures::future::Either;
     use tokio::time::{sleep, timeout, Instant, Duration};
 
-    use crate::combinators::{merge_sort, Event, ScheduleCommand, Scheduler, Timed, StreamExtSplit};
+    use crate::streams::{merge_sort, Event, ScheduleCommand, Scheduler, Timed, StreamExtSplit};
     
     #[tokio::test]
     async fn test_traced_scan() {
@@ -909,7 +1133,7 @@ mod tests{
             Either::Right("b"),
         ]);
 
-        let (mut left_rx, mut right_rx) = input_stream.split_either::<i32, &str, Iter<Either<i32, &str>>>();
+        let (mut left_rx, mut right_rx) = input_stream.split_either::<i32, &str>();
 
         // --- Assert left values ---
         let l1 = timeout(Duration::from_millis(100), left_rx.next())
@@ -949,126 +1173,6 @@ mod tests{
             .expect("right channel closed")
             .is_none());
     }    
-
-    use std::{collections::VecDeque, pin::Pin, task::{Context, Poll}};
-    use futures::Sink;
-
-    use futures::{stream, SinkExt, Stream, StreamExt};
-    use tokio;
-    use tokio_util::sync::PollSender;
-
-    use crate::reconnect_manager::{FailoverSink, ReconnectManager};
-    #[tokio::test]
-    async fn test_failover_sink() {
-        let (tx1, mut rx1) = tokio::sync::mpsc::channel::<i32>(10);
-        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<i32>(10);
-
-        let sinks = stream::iter(vec![PollSender::new(tx1), PollSender::new(tx2)]);
-
-        let mut failover_sink = FailoverSink::new(sinks);
-
-        failover_sink.send(10).await.unwrap();
-        assert_eq!(rx1.recv().await.unwrap(), 10);
-        drop(rx1);
-
-        failover_sink.send(20).await.unwrap();
-        assert_eq!(rx2.recv().await.unwrap(), 20);
-        drop(rx2);
-
-        assert!(failover_sink.send(30).await.is_err());
-    }
-
-    // A simple mock Inner that implements Sink + Stream
-    #[derive(Debug, Clone)]
-    struct MockInner {
-        sent: Vec<i32>,
-        to_recv: VecDeque<i32>,
-    }
-
-    impl Sink<i32> for MockInner {
-        type Error = ();
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, item: i32) -> Result<(), Self::Error> {
-            let this = self.get_mut();
-            this.sent.push(item);
-            Ok(())
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl Stream for MockInner {
-        type Item = i32;
-
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>
-        ) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.to_recv.pop_front())
-        }
-    }
-
-    #[tokio::test]
-    async fn reconnect_manager_basic() {
-
-        let inner = MockInner {
-            sent: vec![],
-            to_recv: VecDeque::from(vec![10, 20, 30, 1, 1, 1]),
-        };
-
-        // on_send just returns a ready future that returns inner
-        let on_send = |mut inner: MockInner, item: i32| {
-            async move {
-                let _ = inner.send(item).await;
-                Ok(inner)
-            }
-        };
-
-        // on_recv just returns a ready future that pops one item
-        let on_recv = |mut inner: MockInner| {
-            async move {
-                let item = inner.next().await;
-                item.map(|i| (inner, i))
-            }
-        };
-        
-        let mgr = ReconnectManager {
-            inner: Some(inner),
-            on_send,
-            send_future: None,
-            send_queue: VecDeque::new(),
-            on_recv,
-            recv_future: None,
-        };
-
-        futures::pin_mut!(mgr);
-
-        // Test sending items
-        let _: Result<(), ()> = mgr.send(1).await;
-        let _: Result<(), ()> = mgr.send(2).await;
-
-        // Receive items from the stream
-        let received: Vec<i32> = mgr.as_mut().take(3).collect().await;
-
-        // Check results
-        assert_eq!(received, vec![10, 20, 30]);
-        // The inner should have received the sent items
-        let inner = mgr.inner.clone().unwrap();
-        assert_eq!(inner.sent, vec![1, 2]);
-    }
 }
 
 

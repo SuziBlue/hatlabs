@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio_tungstenite::tungstenite;
 
 pub mod opcodes;
 pub mod close_codes;
@@ -9,19 +10,29 @@ pub mod intents;
 
 
 
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum GatewayError {
-    #[error("Invalid op code: {}", .0)]
+    #[error("Invalid op code: {0}")]
     InvalidOpCode(u8),
+    #[error("Invalid json: {0}")]
+    SerdeError(#[from] serde_json::Error),
+    #[error("Websocket error: {0}")]
+    WebSocketError(#[from] tungstenite::Error),
+    #[error("Heartbeat error: {0}")]
+    HeartbeatError(#[from] HeartbeatError),
 }
 
+#[derive(Error, Debug)]
+#[error("Heartbeat Timeout")]
+pub struct HeartbeatError {}
+
 #[derive(Serialize, Deserialize)]
-struct RawGatewayPayload {
+pub struct RawGatewayPayload {
     op: u8,
     #[serde(default)]
     d: Value,
-    s: Option<u64>,
-    t: Option<String>,
+    pub s: Option<u64>,
+    pub t: Option<String>,
 }
 
 #[cfg(test)]
