@@ -401,42 +401,45 @@ where
 
 
 pin_project! {
-    pub struct ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> 
+    pub struct ReconnectManager<Inner, SinkItem, StreamItem, E> 
     {
-        inner: Option<Inner>,
+        inner: Arc<Mutex<Inner>>,
 
-        on_send: SendFn, 
+        on_send: Box<dyn FnMut(Arc<Mutex<Inner>>, SinkItem) -> Pin<Box<dyn Future<Output = Result<(), E>>>>>,
         #[pin]
-        send_future: Option<SendFut>,
-        send_queue: VecDeque<Item>,
+        send_future: Option<Pin<Box<dyn Future<Output = Result<(), E>>>>>,
+        send_queue: VecDeque<SinkItem>,
 
-        on_recv: RecvFn, 
+        on_recv: Box<dyn FnMut(Arc<Mutex<Inner>>) -> Pin<Box<dyn Future<Output = Option<StreamItem>>>>>, 
         #[pin]
-        recv_future: Option<RecvFut>,
+        recv_future: Option<Pin<Box<dyn Future<Output = Option<StreamItem>>>>>,
 
     }
 }
 
-impl<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> {
-    pub fn new(inner: Inner, on_send: SendFn, on_recv: RecvFn) -> Self {
+impl<Inner, SinkItem, StreamItem, E> ReconnectManager<Inner, SinkItem, StreamItem, E> {
+    pub fn new(
+        inner: Inner, 
+        on_send: impl (FnMut(Arc<Mutex<Inner>>, SinkItem) -> Pin<Box<dyn Future<Output = Result<(), E>>>>) + 'static, 
+        on_recv: impl (FnMut(Arc<Mutex<Inner>>) -> Pin<Box<dyn Future<Output = Option<StreamItem>>>>) + 'static
+    ) -> Self 
+    {
         Self { 
-            inner: Some(inner), 
-            on_send, 
+            inner: Arc::new(Mutex::new(inner)),
+            on_send: Box::new(on_send), 
             send_future: None, 
             send_queue: VecDeque::new(), 
-            on_recv, 
+            on_recv: Box::new(on_recv), 
             recv_future: None 
         }
     }
 }
 
-impl<Inner, Item, GoodItem, SendFn, SendFut, RecvFn, RecvFut> Stream for ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> 
+impl<Inner, SinkItem, StreamItem, E> Stream for ReconnectManager<Inner, SinkItem, StreamItem, E> 
 where 
     Inner: Stream,
-    RecvFn: FnMut(Inner) -> RecvFut,
-    RecvFut: Future<Output = Option<(Inner, GoodItem)>>,
 {
-    type Item = GoodItem;
+    type Item = StreamItem;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -446,9 +449,8 @@ where
             if let Some(fut) = this.recv_future.as_mut().as_pin_mut() {
                 match fut.poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some((new_inner, item))) => {
+                    Poll::Ready(Some(item)) => {
                         this.recv_future.set(None);
-                        *this.inner = Some(new_inner);
                         return Poll::Ready(Some(item));
                     }
                     Poll::Ready(None) => {
@@ -456,23 +458,16 @@ where
                         return Poll::Ready(None);
                     }
                 }
-            }
-
-            if let Some(inner) = this.inner.take() {
-                this.recv_future.set(Some((this.on_recv)(inner)));
-                continue
             } else {
-                return Poll::Pending
+                this.recv_future.set(Some((this.on_recv)(this.inner.clone())));
             }
         }
     }
 }
 
-impl<Inner, Item, E, SendFn, SendFut, RecvFn, RecvFut> Sink<Item> for ReconnectManager<Inner, Item, SendFn, SendFut, RecvFn, RecvFut> 
+impl<Inner, SinkItem, StreamItem, E> Sink<SinkItem> for ReconnectManager<Inner, SinkItem, StreamItem, E> 
 where 
-    Inner: Sink<Item>,
-    SendFn: FnMut(Inner, Item) -> SendFut,
-    SendFut: Future<Output = Result<Inner, E>>,
+    Inner: Sink<SinkItem>,
 {
     type Error = E;
 
@@ -480,7 +475,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: SinkItem) -> Result<(), Self::Error> {
         let this = self.project();
 
         this.send_queue.push_back(item);
@@ -495,31 +490,25 @@ where
             if let Some(fut) = this.send_future.as_mut().as_pin_mut() {
                 match fut.poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(inner)) => {
+                    Poll::Ready(Ok(())) => {
                         this.send_future.set(None);
-                        *this.inner = Some(inner);
                         return Poll::Ready(Ok(()));
                     },
                     Poll::Ready(Err(e)) => {
                         this.send_future.set(None);
-                        *this.inner = None;
                         return Poll::Ready(Err(e));
                     }
                 }
             }
 
-            if let Some(inner) = this.inner.take() {
-                match this.send_queue.pop_front() {
-                    Some(item) => {
-                        this.send_future.set(Some((this.on_send)(inner, item)));
-                        continue;
-                    }
-                    None => {
-                        return Poll::Ready(Ok(()));
-                    }
+            match this.send_queue.pop_front() {
+                Some(item) => {
+                    this.send_future.set(Some((this.on_send)(this.inner.clone(), item)));
+                    continue;
                 }
-            } else {
-                return Poll::Pending;
+                None => {
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }

@@ -96,7 +96,10 @@ async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_sessio
     };
 }
 
-pub async fn create_connection(url: &str, gateway_session: Arc<RwLock<GatewaySession>>) -> (impl Sink<GatewaySendEvent, Error = GatewayError>, impl Stream<Item = Result<GatewayIncoming, GatewayError>>) {
+pub async fn create_connection(
+    url: &str, gateway_session: Arc<RwLock<GatewaySession>>
+) -> (Pin<Box<dyn Sink<GatewaySendEvent, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming, GatewayError>>>>) 
+{
     let (ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let (outgoing, incoming) = ws_connection.split();
@@ -146,7 +149,7 @@ pub async fn create_connection(url: &str, gateway_session: Arc<RwLock<GatewaySes
     let final_stream = futures::stream::select(other, heartbeat_manager);
 
 
-    return (fan_in_encoded, final_stream)
+    return (Box::pin(fan_in_encoded), Box::pin(final_stream))
 }
 
 pub async fn resume_connection<NewInner>(session: Arc<RwLock<GatewaySession>>) 
@@ -228,25 +231,15 @@ where
     return None
 }
 
-pub async fn connect_websocket(url: &str) -> impl Sink<GatewaySendEvent> + Stream
+pub async fn connect_websocket(url: &str)
 {
     let gateway_session = Arc::new(RwLock::new(GatewaySession::new()));
-
-    let on_recv = {
-        let session_clone = gateway_session.clone();
-        move |inner| {
-            let session = session_clone.clone();
-            async move {
-                on_recv(inner, session).await
-            }
-        }
-    };
 
     let (gateway_sink, gateway_stream) = create_connection(url, gateway_session.clone()).await;
 
     let duplex = Duplex::new(gateway_sink, gateway_stream);
 
-    ReconnectManager::new(duplex, on_send, on_recv)
+    todo!()
 }
 
 
