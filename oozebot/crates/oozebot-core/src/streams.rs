@@ -965,23 +965,119 @@ where
 }
 
 impl<Inner, InnerError, E, Item> Sink<Item> for ErrorHandler<Inner, InnerError, E, VecDeque<Item>>
+where 
+    Inner: Sink<Item, Error = InnerError> + Unpin,
+    Item: Clone,
 {
     type Error = E;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        todo!()
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        return Poll::Ready(Ok(()))
     }
 
     fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
-        todo!()
+        let this = self.project();
+        this.send_queue.push_back(item);
+        return Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        todo!()
+        let mut this = self.project();
+
+        while !this.send_queue.is_empty() {
+            match this.state.take() {
+                Some(Either::Left(mut inner)) => {
+                    match inner.poll_ready_unpin(cx) {
+                        Poll::Ready(Ok(())) => {
+                            let item = this.send_queue.pop_front().unwrap();
+                            match inner.start_send_unpin(item.clone()) {
+                                Ok(()) => {
+                                    *this.state = Some(Either::Left(inner));
+                                    continue
+                                }
+                                Err(e) => {
+                                    let fut = (this.handler)(inner, e);
+                                    *this.state = Some(Either::Right(fut));
+                                    this.send_queue.push_front(item);
+                                    continue
+                                }
+                            }
+                        },
+                        Poll::Ready(Err(e)) => {
+                            let fut = (this.handler)(inner, e);
+                            *this.state = Some(Either::Right(fut));
+                            continue
+                        },
+                        Poll::Pending => {
+                            *this.state = Some(Either::Left(inner));
+                            return Poll::Pending
+                        }
+                    }
+                },
+                Some(Either::Right(mut fut)) => {
+                    match fut.poll_unpin(cx) {
+                        Poll::Ready(Ok(new_inner)) => {
+                            *this.state = Some(Either::Left(new_inner));
+                            continue
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err(e))
+                        }
+                        Poll::Pending => {
+                            *this.state = Some(Either::Right(fut));
+                            return Poll::Pending
+                        }
+                    }
+                },
+                None => panic!("Sink polled after returning fatal error"),
+            }
+        }
+
+        return Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        todo!()
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush(cx));
+
+        let mut this = self.project();
+
+        loop {
+            match this.state.take() {
+                Some(Either::Left(mut inner)) => {
+                    match inner.poll_close_unpin(cx) {
+                        Poll::Ready(Ok(())) => {
+                            *this.state = Some(Either::Left(inner));
+                            return Poll::Ready(Ok(()))
+                        }
+                        Poll::Ready(Err(e)) => {
+                            let fut = (this.handler)(inner, e);
+                            *this.state = Some(Either::Right(fut));
+                            continue
+                        }
+                        Poll::Pending => {
+                            *this.state = Some(Either::Left(inner));
+                            return Poll::Pending
+                        }
+                    }
+                }
+                Some(Either::Right(mut fut)) => {
+                    match fut.poll_unpin(cx) {
+                        Poll::Ready(Ok(new_inner)) => {
+                            *this.state = Some(Either::Left(new_inner));
+                            continue
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err(e))
+                        }
+                        Poll::Pending => {
+                            *this.state = Some(Either::Right(fut));
+                            return Poll::Pending
+                        }
+                    }
+                },
+                None => panic!("Sink polled after returning fatal error"),
+            }
+        }
     }
 }
 
