@@ -1081,6 +1081,102 @@ where
     }
 }
 
+pub enum CloseEvent<Event> {
+    Internal(Event),
+    External(Event),
+}
+
+pub trait SessionItem<Event> {
+    type Data;
+
+    fn should_close(self) -> Either<Self::Data, Event>;
+}
+
+pin_project! {
+    pub struct SessionHandler<Inner, Event, Queue = ()> 
+    {
+        state: Option<Either<Pin<Box<Inner>>, Pin<Box<dyn Future<Output = Option<Pin<Box<Inner>>>>>>>>,
+
+        handler: Box<dyn FnMut(Pin<Box<Inner>>, Option<CloseEvent<Event>>) -> Pin<Box<dyn Future<Output = Option<Pin<Box<Inner>>>>>>>,
+
+        send_queue: Queue,
+    }
+}
+
+impl<Inner, Event, Queue> SessionHandler<Inner, Event, Queue> 
+{
+    fn poll_state(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Pin<Box<Inner>>>> {
+        let this = self.project();
+
+        loop {
+            match this.state.take() {
+                Some(Either::Left(inner)) => {
+                    return Poll::Ready(Some(inner))
+                },
+                Some(Either::Right(mut fut)) => {
+                    match fut.poll_unpin(cx) {
+                        Poll::Pending => {
+                            *this.state = Some(Either::Right(fut));
+                            return Poll::Pending
+                        },
+                        Poll::Ready(Some(new_inner)) => return Poll::Ready(Some(new_inner)),
+                        Poll::Ready(None) => return Poll::Ready(None),
+                    }
+                },
+                None => panic!("poll_state called before replacing state."),
+            } 
+        }
+    }
+}
+
+impl<Inner, Event, Queue, InnerItem> Stream for SessionHandler<Inner, Event, Queue>
+where 
+    Inner: Stream<Item = InnerItem>,
+    InnerItem: SessionItem<Event>,
+{
+    type Item = InnerItem::Data;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match ready!(self.as_mut().poll_state(cx)) {
+                Some(mut inner) => {
+                    match inner.as_mut().poll_next(cx) {
+                        Poll::Ready(Some(inner_item)) => {
+                            match inner_item.should_close() {
+                                Either::Left(data) => {
+                                    *self.as_mut().project().state = Some(Either::Left(inner));
+                                    return Poll::Ready(Some(data))
+                                },
+                                Either::Right(event) => {
+                                    let fut = (self.as_mut().handler)(inner, Some(CloseEvent::External(event)));
+                                    *self.as_mut().project().state = Some(Either::Right(fut));
+                                    continue
+                                }
+
+                            }
+                        }
+                        Poll::Ready(None) => {
+                            let fut = (self.as_mut().handler)(inner, None);
+                            *self.as_mut().project().state = Some(Either::Right(fut));
+                            continue
+                        },
+                        Poll::Pending => {
+                            *self.as_mut().project().state = Some(Either::Left(inner));
+                            return Poll::Pending
+                        }
+                    }
+                },
+                None => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
+
+
+
+
+
 
 
 
