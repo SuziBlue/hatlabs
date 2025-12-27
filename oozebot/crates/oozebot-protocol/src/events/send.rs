@@ -1,6 +1,8 @@
 use serde::Serialize;
 use tokio_tungstenite::tungstenite::{self, Utf8Bytes};
 
+use super::receive::GatewayCloseEvent;
+
 impl From<Heartbeat> for GatewaySendEvent {
     fn from(value: Heartbeat) -> Self {
         GatewaySendEvent::Heartbeat(value)
@@ -23,6 +25,12 @@ pub enum GatewaySendEvent {
     RequestSoundboardSounds(RequestSoundboardSounds),
     UpdateVoiceState(UpdateVoiceState),
     UpdatePresence(UpdatePresence),
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, PartialOrd)]
+pub enum GatewayOutgoing {
+    Send(GatewaySendEvent),
+    Close(GatewayCloseEvent),
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, PartialOrd)]

@@ -1,6 +1,5 @@
-use serde::{Deserialize, Deserializer};
-use serde_json::Value;
-use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Utf8Bytes};
+use serde::{Deserialize, Serialize};
+use tokio_tungstenite::tungstenite::{protocol::CloseFrame, Message, Utf8Bytes};
 
 use crate::{close_codes::GatewayCloseCode, opcodes::GatewayOpCode, GatewayError, RawGatewayPayload};
 
@@ -25,8 +24,23 @@ impl TryFrom<Utf8Bytes> for GatewayRecvEvent {
 impl From<Option<CloseFrame>> for GatewayCloseEvent {
     fn from(value: Option<CloseFrame>) -> Self {
         match value {
-            Some(close_frame) => GatewayCloseEvent { close_code: close_frame.code.into(), reason: close_frame.reason.to_string() },
-            None => GatewayCloseEvent { close_code: GatewayCloseCode::None, reason: "".to_string() }
+            Some(close_frame) => GatewayCloseEvent { close_code: Some(close_frame.code.into()), reason: close_frame.reason.to_string() },
+            None => GatewayCloseEvent { close_code: None, reason: "".to_string() }
+        }
+    }
+}
+
+impl From<GatewayCloseEvent> for Message {
+    fn from(value: GatewayCloseEvent) -> Self {
+        Message::Close(value.into())
+    }
+}
+
+impl From<GatewayCloseEvent> for Option<CloseFrame> {
+    fn from(value: GatewayCloseEvent) -> Self {
+        match value.close_code {
+            Some(code) => Some(CloseFrame { code: code.into(), reason: value.reason.into() }),
+            None => None
         }
     }
 }
@@ -37,9 +51,9 @@ pub enum GatewayIncoming {
     Close(GatewayCloseEvent),
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd)]
 pub struct GatewayCloseEvent {
-    pub close_code: GatewayCloseCode,
+    pub close_code: Option<GatewayCloseCode>,
     pub reason: String,
 }
 

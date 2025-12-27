@@ -39,7 +39,6 @@ pub enum GatewayCloseCode {
     DisallowedIntents = 4014,
     /// An unknown or undocumented close code.
     Unknown(u16),
-    None,
 }
 
 impl GatewayCloseCode {
@@ -55,7 +54,6 @@ impl GatewayCloseCode {
                 | GatewayCloseCode::InvalidSeq
                 | GatewayCloseCode::RateLimited
                 | GatewayCloseCode::SessionTimedOut
-                | GatewayCloseCode::None
         )
     }
 }
@@ -82,10 +80,39 @@ impl From<u16> for GatewayCloseCode {
     }
 }
 
+impl From<GatewayCloseCode> for u16 {
+    fn from(value: GatewayCloseCode) -> Self {
+        match value {
+            GatewayCloseCode::UnknownError => 4000, 
+            GatewayCloseCode::UnknownOpcode => 4001,
+            GatewayCloseCode::DecodeError => 4002,
+            GatewayCloseCode::NotAuthenticated => 4003,
+            GatewayCloseCode::AuthenticationFailed => 4004,
+            GatewayCloseCode::AlreadyAuthenticated => 4005,
+            GatewayCloseCode::InvalidSeq => 4007,
+            GatewayCloseCode::RateLimited => 4008,
+            GatewayCloseCode::SessionTimedOut => 4009,
+            GatewayCloseCode::InvalidShard => 4010,
+            GatewayCloseCode::ShardingRequired => 4011,
+            GatewayCloseCode::InvalidApiVersion => 4012,
+            GatewayCloseCode::InvalidIntents => 4013,
+            GatewayCloseCode::DisallowedIntents => 4014,
+            GatewayCloseCode::Unknown(other) => other,
+            
+        }
+    }
+}
+
 impl From<CloseCode> for GatewayCloseCode {
     fn from(value: CloseCode) -> Self {
         let code = value.into();
         From::<u16>::from(code)
+    }
+}
+
+impl From<GatewayCloseCode> for CloseCode {
+    fn from(value: GatewayCloseCode) -> Self {
+        CloseCode::from(Into::<u16>::into(value))
     }
 }
 

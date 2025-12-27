@@ -928,7 +928,7 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
 
-        loop{
+        loop {
             match this.state.take() {
                 Some(Either::Left(mut inner)) => {
                     let next = ready!(inner.poll_next_unpin(cx));
@@ -1086,10 +1086,29 @@ pub enum CloseEvent<Event> {
     External(Event),
 }
 
-pub trait SessionItem<Event> {
-    type Data;
+pub struct SinkClosedError;
 
-    fn should_close(self) -> Either<Self::Data, Event>;
+pub trait ClosableSession<Event> {
+    type Error;
+
+    async fn close(&mut self, event: Event) -> Result<(), Self::Error>;
+}
+
+pub trait HasSession {
+    type Session;
+    fn session_mut(&mut self) -> &mut Self::Session;
+}
+
+impl<T, Event> ClosableSession<Event> for T
+where 
+    T: HasSession,
+    T::Session: ClosableSession<Event>,
+{
+    type Error = <T::Session as ClosableSession<Event>>::Error;
+
+    async fn close(&mut self, event: Event) -> Result<(), Self::Error> {
+        self.session_mut().close(event).await
+    }
 }
 
 pin_project! {
@@ -1103,8 +1122,83 @@ pin_project! {
     }
 }
 
+impl<Inner, Event> SessionHandler<Inner, Event> 
+{
+    pub fn from_not_sink<F, Fut>(inner: Inner, handler: F) -> Self 
+    where 
+        F: FnMut(Pin<Box<Inner>>, Option<CloseEvent<Event>>) -> Fut + 'static,
+        Fut: Future<Output = Option<Pin<Box<Inner>>>> + 'static,
+    {
+        Self::new_with_queue(inner, handler, ())
+    }
+}
+
+impl<Inner, DataType, Event> SessionHandler<Inner, Event, VecDeque<DataType>> 
+where 
+    Inner: Sink<Either<DataType, Event>>,
+{
+    pub fn from_sink<F, Fut>(inner: Inner, handler: F) -> Self 
+    where 
+        F: FnMut(Pin<Box<Inner>>, Option<CloseEvent<Event>>) -> Fut + 'static,
+        Fut: Future<Output = Option<Pin<Box<Inner>>>> + 'static,
+    {
+        Self::new_with_queue(inner, handler, VecDeque::new())
+    }
+
+}
+
+impl<Inner, DataType, Event> ClosableSession<Event> for SessionHandler<Inner, Event, VecDeque<DataType>> 
+where 
+    Inner: Sink<Either<DataType, Event>>,
+{
+    type Error = <Self as Sink<DataType>>::Error;
+    
+    async fn close(&mut self, event: Event) -> Result<(), Self::Error> {
+        let item = Either::Right(event);
+
+        match &mut self.state {
+            Some(Either::Left(inner)) => {
+                inner.as_mut().send(item).await.map_err(Either::Right)?;
+                inner.as_mut().flush().await.map_err(Either::Right)?;
+            }
+            Some(Either::Right(fut)) => {
+                if let Some(mut inner) = fut.await {
+                    inner.as_mut().send(item).await.map_err(Either::Right)?;
+                    inner.as_mut().flush().await.map_err(Either::Right)?;
+                    self.state = Some(Either::Left(inner));
+                } else {
+                    return Err(Either::Left(SinkClosedError))
+                }
+            }
+            None => {
+                return Err(Either::Left(SinkClosedError))
+            }
+        }
+
+        <Self as SinkExt<DataType>>::close(self).await
+    }
+}
+
 impl<Inner, Event, Queue> SessionHandler<Inner, Event, Queue> 
 {
+    fn new_with_queue<F, Fut>(
+        inner: Inner,
+        mut handler: F,
+        send_queue: Queue,
+    ) -> Self
+    where
+        F: FnMut(Pin<Box<Inner>>, Option<CloseEvent<Event>>) -> Fut + 'static,
+        Fut: Future<Output = Option<Pin<Box<Inner>>>> + 'static,
+    {
+        Self {
+            state: Some(Either::Left(Box::pin(inner))),
+            handler: Box::new(move |inner, event| {
+                Box::pin(handler(inner, event))
+            }),
+            send_queue,
+        }
+    }
+
     fn poll_state(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Pin<Box<Inner>>>> {
         let this = self.project();
 
@@ -1123,18 +1217,17 @@ impl<Inner, Event, Queue> SessionHandler<Inner, Event, Queue>
                         Poll::Ready(None) => return Poll::Ready(None),
                     }
                 },
-                None => panic!("poll_state called before replacing state."),
+                None => return Poll::Ready(None),
             } 
         }
     }
 }
 
-impl<Inner, Event, Queue, InnerItem> Stream for SessionHandler<Inner, Event, Queue>
+impl<Inner, Event, Queue, DataType> Stream for SessionHandler<Inner, Event, Queue>
 where 
-    Inner: Stream<Item = InnerItem>,
-    InnerItem: SessionItem<Event>,
+    Inner: Stream<Item = Either<DataType, Event>>,
 {
-    type Item = InnerItem::Data;
+    type Item = DataType;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -1142,7 +1235,7 @@ where
                 Some(mut inner) => {
                     match inner.as_mut().poll_next(cx) {
                         Poll::Ready(Some(inner_item)) => {
-                            match inner_item.should_close() {
+                            match inner_item {
                                 Either::Left(data) => {
                                     *self.as_mut().project().state = Some(Either::Left(inner));
                                     return Poll::Ready(Some(data))
@@ -1172,6 +1265,89 @@ where
     }
 }
 
+impl<Inner, Event, DataType> Sink<DataType> for SessionHandler<Inner, Event, VecDeque<DataType>>
+where 
+    Inner: Sink<Either<DataType, Event>>,
+{
+    type Error = Either<SinkClosedError, Inner::Error>;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        return Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: DataType) -> Result<(), Self::Error> {
+        self.project().send_queue.push_back(item.into());
+        return Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut inner = match ready!(self.as_mut().poll_state(cx)) {
+            Some(inner) => inner,
+            None => return Poll::Ready(Err(Either::Left(SinkClosedError)))
+        };
+
+        while !self.send_queue.is_empty() {
+            match inner.as_mut().poll_ready(cx) {
+                Poll::Ready(Ok(())) => {
+                    let item = self.as_mut().project().send_queue.pop_front().unwrap();
+                    inner.as_mut().start_send(Either::Left(item));
+                    continue
+                },
+                Poll::Ready(Err(e)) => {
+                    *self.project().state = Some(Either::Left(inner));
+                    return Poll::Ready(Err(Either::Right(e)))
+                }
+                Poll::Pending => {
+                    *self.project().state = Some(Either::Left(inner));
+                    return Poll::Pending
+                }
+            }
+        }
+
+
+        match inner.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                *self.project().state = Some(Either::Left(inner));
+                return Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                *self.project().state = Some(Either::Left(inner));
+                return Poll::Ready(Err(Either::Right(e)))
+            }
+            Poll::Pending => {
+                *self.project().state = Some(Either::Left(inner));
+                return Poll::Pending
+            }
+        }
+
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+
+        match ready!(self.as_mut().poll_state(cx)) {
+            Some(mut inner) => {
+                match inner.as_mut().poll_close(cx) {
+                    Poll::Ready(Ok(())) => {
+                        *self.project().state = Some(Either::Left(inner));
+                        return Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Err(e)) => {
+                        *self.project().state = Some(Either::Left(inner));
+                        return Poll::Ready(Err(Either::Right(e)))
+                    }
+                    Poll::Pending => {
+                        *self.project().state = Some(Either::Left(inner));
+                        return Poll::Pending
+                    }
+                }
+            }
+            None => {
+                return Poll::Ready(Err(Either::Left(SinkClosedError)))
+            }
+        }
+    }
+}
 
 
 

@@ -6,19 +6,18 @@ use std::sync::Arc;
 use std::task::Context;
 use std::{task::Poll, time::Duration};
 
-use futures::future::{select, Either, Map, Select};
-use futures::task::waker;
-use futures::{ready, FutureExt, Sink, SinkExt, Stream, StreamExt, TryStream};
-use oozebot_protocol::close_codes::GatewayCloseCode;
+use futures::{future, ready, FutureExt, Sink, SinkExt, Stream, StreamExt, TryStreamExt};
+use futures_util::future::Either;
 use oozebot_protocol::events::receive::{self, GatewayCloseEvent, GatewayIncoming, GatewayRecvEvent};
-use oozebot_protocol::events::send::{self, GatewaySendEvent};
+use oozebot_protocol::events::send::{self, GatewayOutgoing, GatewaySendEvent};
 use oozebot_protocol::{GatewayError, HeartbeatError, RawGatewayPayload};
 use pin_project_lite::pin_project;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio::time::{interval, Interval};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 
-use crate::streams::{Duplex, FanInSink, ReconnectManager, StreamExtSplit};
+use crate::streams::{CloseEvent, Duplex, FanInSink, SessionHandler, StreamExtSplit};
 
 
 
@@ -55,21 +54,34 @@ impl From<Heartbeat> for GatewaySendEvent {
     }
 }
 
+impl From<Heartbeat> for Either<GatewaySendEvent, GatewayCloseEvent> {
+    fn from(value: Heartbeat) -> Self {
+        Either::Left(value.into())
+    }
+}
+
+
 type Seq = Option<u64>;
 
 pub struct GatewaySession {
     sequence_number: Seq,
+    resume_gateway_url: Option<String>,
+    token: String,
+    session_id: Option<String>,
 }
 
 impl GatewaySession {
-    fn new() -> GatewaySession {
+    fn new(token: String) -> GatewaySession {
         GatewaySession {
             sequence_number: None,
+            resume_gateway_url: None,
+            token,
+            session_id: None,
         }
     }
 }
 
-async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_session: Arc<RwLock<GatewaySession>>) -> Result<GatewayIncoming, GatewayError> {
+async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_session: Arc<RwLock<GatewaySession>>) -> Result<Either<GatewayRecvEvent, GatewayCloseEvent>, GatewayError> {
 
     match msg {
         Ok(Message::Text(text)) => {
@@ -80,7 +92,7 @@ async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_sessio
                         session_write.sequence_number = raw.s;
                     }
                     match TryInto::<GatewayRecvEvent>::try_into(raw) {
-                        Ok(event) => return Ok(GatewayIncoming::Recv(event)),
+                        Ok(event) => return Ok(Either::Left(event)),
                         Err(e) => return Err(Into::<GatewayError>::into(e))
                     }
                 },
@@ -89,7 +101,7 @@ async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_sessio
         },
         Ok(Message::Close(maybe_frame)) => {
             let close_event = Into::<GatewayCloseEvent>::into(maybe_frame);
-            return Ok(GatewayIncoming::Close(close_event))
+            return Ok(Either::Right(close_event))
         },
         Ok(msg) => {panic!("Received an unexpected message type from Discord gateway: {:?}", msg)},
         Err(e) => return Err(Into::<GatewayError>::into(e))
@@ -97,10 +109,10 @@ async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_sessio
 }
 
 pub async fn create_connection(
-    url: &str, gateway_session: Arc<RwLock<GatewaySession>>
-) -> (Pin<Box<dyn Sink<GatewaySendEvent, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming, GatewayError>>>>) 
+    ws_connection: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, 
+    gateway_session: Arc<RwLock<GatewaySession>>
+) -> (Pin<Box<dyn Sink<Either<GatewaySendEvent, GatewayCloseEvent>, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<Either<GatewayRecvEvent, GatewayCloseEvent>, GatewayError>>>>) 
 {
-    let (ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let (outgoing, incoming) = ws_connection.split();
 
@@ -119,9 +131,9 @@ pub async fn create_connection(
         .expect("Websocket should not close")
         .expect("Websocket should not error")
         {
-            GatewayIncoming::Recv(GatewayRecvEvent::Hello(h)) => h,
-            GatewayIncoming::Recv(_) => panic!("Received a gateway event other than Hello"),
-            GatewayIncoming::Close(c) => panic!("Gateway closed immediately: {:?}", c)
+            Either::Left(GatewayRecvEvent::Hello(h)) => h,
+            Either::Left(_) => panic!("Received a gateway event other than Hello"),
+            Either::Right(c) => panic!("Gateway closed immediately: {:?}", c)
         };
 
     let heartbeat_interval = hello.heartbeat_interval;
@@ -129,115 +141,106 @@ pub async fn create_connection(
     let (other, heartbeat_events) = decoded
         .map(|item| {
             match item {
-                Ok(GatewayIncoming::Recv(GatewayRecvEvent::Heartbeat(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
-                Ok(GatewayIncoming::Recv(GatewayRecvEvent::HeartbeatAck(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
+                Ok(Either::Left(GatewayRecvEvent::Heartbeat(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
+                Ok(Either::Left(GatewayRecvEvent::HeartbeatAck(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
                 res => Either::Left(res),
             }
         })
         .split_either();
 
-    let encoded = Box::pin(outgoing.with(|event: GatewaySendEvent| async {
-        Ok(event.into())
+    let encoded = Box::pin(outgoing.with(|event: Either<GatewaySendEvent, GatewayCloseEvent>| async {
+        match event {
+            Either::Left(send) => Ok(send.into()),
+            Either::Right(close) => Ok(close.into()),
+        }
     }));
 
     let fan_in_encoded = FanInSink::new(encoded);
 
     let heartbeat_sink = fan_in_encoded.clone();
 
-    let heartbeat_manager = HeartbeatManager::new(heartbeat_sink, heartbeat_events, Duration::from_millis(heartbeat_interval), gateway_session.clone());
+    let heartbeat_manager = HeartbeatManager::new(heartbeat_sink, heartbeat_events, Duration::from_millis(heartbeat_interval), gateway_session.clone())
+        .map(|item| {
+            match item {
+                Ok(GatewayIncoming::Recv(recv)) => Ok(Either::Left(recv)),
+                Ok(GatewayIncoming::Close(close)) => Ok(Either::Right(close)),
+                Err(e) => Err(e)
+            }
+        });
 
     let final_stream = futures::stream::select(other, heartbeat_manager);
-
 
     return (Box::pin(fan_in_encoded), Box::pin(final_stream))
 }
 
-pub async fn resume_connection<NewInner>(session: Arc<RwLock<GatewaySession>>) 
-    -> Result<NewInner, ()> 
-where 
-    NewInner: Sink<GatewaySendEvent, Error = GatewayError> + Stream<Item = Result<GatewayIncoming, GatewayError>> + Unpin
+pub async fn resume_connection(session: Arc<RwLock<GatewaySession>>) -> Option<Duplex<Pin<Box<dyn Sink<Either<GatewaySendEvent, GatewayCloseEvent>, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<Either<GatewayRecvEvent, GatewayCloseEvent>, GatewayError>>>>, Either<GatewaySendEvent, GatewayCloseEvent>>> 
 {
-    let (mut inner, _response) = tokio_tungstenite::connect_async(resume_gateway_url).await.unwrap();
 
     let session_read = session.read().await;
 
-    let resume_event = GatewaySendEvent::Resume(
+    let request = session_read.resume_gateway_url.clone()
+        .expect("No resume url")
+        .into_client_request()
+        .expect("Invalid resume url");
+
+    let (ws_connection, _response) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    let (mut sink, stream) = create_connection(ws_connection, session.clone()).await;
+
+
+
+    let resume_event = Either::Left(GatewaySendEvent::Resume(
         send::Resume { 
-            token: session_read.token.to_string(), 
-            session_id: session_read.session_id.to_string(), 
-            seq: session_read.sequence_number 
+            token: session_read.token.clone(),
+            session_id: session_read.session_id.clone().expect("No session id"),
+            seq: session_read.sequence_number.expect("No sequence number"),
         }
-    );
+    ));
 
-    inner.send(resume_event.into()).await.unwrap();
+    sink.send(resume_event.into()).await.unwrap();
 
-    Ok(inner)
+    let inner = Duplex::new(sink, stream);
+    Some(inner)
 }
 
-async fn on_send<Inner>(mut inner: Inner, item: GatewaySendEvent) -> Result<Inner, GatewayError> 
-where 
-    Inner: Sink<GatewaySendEvent, Error = GatewayError> + Stream<Item = Result<GatewayIncoming, GatewayError>> + Unpin
+pub async fn connect_websocket(url: &str, token: &str)
 {
-    match inner.send(item).await {
-        Ok(_) => return Ok(inner),
-        Err(e) => return  Err(e),
-    }
-}
+    let gateway_session = Arc::new(RwLock::new(GatewaySession::new(token.to_string())));
 
-async fn on_recv<Inner>(
-    mut inner: Inner, 
-    gateway_session: Arc<RwLock<GatewaySession>>
-) -> Option<(Inner, GatewayRecvEvent)> 
-where 
-    Inner: Sink<GatewaySendEvent, Error = GatewayError> + Stream<Item = Result<GatewayIncoming, GatewayError>> + Unpin
-{
+    let (ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
 
-    while let Some(res) = inner.next().await {
-        match res {
-            Ok(GatewayIncoming::Close(close_event)) => {
-                if close_event.close_code.can_reconnect() {
-                    match resume_connection(gateway_session.clone()).await {
-                        Ok(new_inner) => {
-                            inner = new_inner;
-                            continue
-                        },
-                        Err(e) => {
-                            eprintln!("Could not resume connection: {:?}", e);
-                            return None;
-                        }
-                    }
-                } else {
-                    eprintln!("Could not reconnect. Reason: {:?}", close_event.reason);
-                    return None;
-                }
-            }
-            Ok(GatewayIncoming::Recv(recv_event)) => return Some((inner, recv_event)),
-            Err(e) => {
-                eprintln!("Gateway error: {:?}. Trying to resume connection.", e);
-                match resume_connection(gateway_session.clone()).await {
-                    Ok(new_inner) => {
-                        inner = new_inner;
-                        continue
-                    },
-                    Err(e) => {
-                        eprintln!("Could not resume connection: {:?}", e);
-                        return None;
-                    }
-                }
-            }
-        }
-    };
-
-    return None
-}
-
-pub async fn connect_websocket(url: &str)
-{
-    let gateway_session = Arc::new(RwLock::new(GatewaySession::new()));
-
-    let (gateway_sink, gateway_stream) = create_connection(url, gateway_session.clone()).await;
+    let (gateway_sink, gateway_stream) = create_connection(ws_connection, gateway_session.clone()).await;
 
     let duplex = Duplex::new(gateway_sink, gateway_stream);
+
+    let session_manager = SessionHandler::from_sink(duplex, move |mut inner, event| {
+
+        let gateway_session = gateway_session.clone();
+
+        async move {
+            match event {
+                Some(CloseEvent::Internal(close)) => {
+                    let _ = inner.send(Either::Right(close)).await; 
+                    let _ = inner.close().await;
+                    return None
+                }
+                Some(CloseEvent::External(close)) => {
+                    if let Some(code) = close.close_code {
+                        if code.can_reconnect() {
+                            let new_inner = resume_connection(gateway_session.clone()).await.map(Box::pin);
+                            return new_inner
+                        }
+                    }
+
+                    return None
+                }
+                None => {
+                    let new_inner = resume_connection(gateway_session.clone()).await.map(Box::pin);
+                    return new_inner
+                }
+            }
+        }
+    });
 
     todo!()
 }
