@@ -11,7 +11,7 @@ use oozebot_protocol::events::send::{self, ClientProperties, GatewayOutgoing, Ga
 use oozebot_protocol::intents::Intents;
 use oozebot_protocol::{GatewayError, HeartbeatError, RawGatewayPayload, WithSequenceNumber};
 use pin_project_lite::pin_project;
-use tokio::time::{interval, Interval};
+use tokio::time::{interval, interval_at, Instant, Interval};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tracing::info;
@@ -185,9 +185,9 @@ pub async fn connect_websocket(url: &str, token: &str) -> impl Sink<GatewayOutgo
 
     gateway_sink.send(GatewayOutgoing::Send(GatewaySendEvent::Identify(identify))).await.unwrap();
 
-    let mut sequence_number = None;
-    let mut resume_gateway_url = "".to_string();
-    let mut session_id = "".to_string();
+    let sequence_number: Option<u64>;
+    let resume_gateway_url: String;
+    let session_id: String;
 
     match gateway_stream.next().await {
         Some(Ok(GatewayIncoming::Recv(recv))) => {
@@ -378,11 +378,14 @@ where
     Si: Sink<GatewayOutgoing>
 {
     pub fn new(sink: Si, incoming: S, heartbeat_interval: Duration) -> Self {
+        let mut interval = interval(heartbeat_interval);
+        interval.reset();
+
         HeartbeatManager { 
             sink,
             send_queue: VecDeque::new(),
             incoming, 
-            interval: interval(heartbeat_interval), 
+            interval, 
             ack_received: true,
             sequence_number: None,
         }
