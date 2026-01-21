@@ -1,23 +1,22 @@
 
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::Context;
 use std::{task::Poll, time::Duration};
 
-use futures::{future, ready, FutureExt, Sink, SinkExt, Stream, StreamExt, TryStreamExt};
-use futures_util::future::Either;
-use oozebot_protocol::events::receive::{self, GatewayCloseEvent, GatewayIncoming, GatewayRecvEvent};
-use oozebot_protocol::events::send::{self, GatewayOutgoing, GatewaySendEvent};
-use oozebot_protocol::{GatewayError, HeartbeatError, RawGatewayPayload};
+use either::Either;
+use futures::{ready, FutureExt, Sink, SinkExt, Stream, StreamExt};
+use oozebot_protocol::close_codes::GatewayCloseEvent;
+use oozebot_protocol::events::receive::{self, GatewayIncoming, GatewayRecvEvent};
+use oozebot_protocol::events::send::{self, ClientProperties, GatewayOutgoing, GatewaySendEvent, Identify};
+use oozebot_protocol::intents::Intents;
+use oozebot_protocol::{GatewayError, HeartbeatError, RawGatewayPayload, WithSequenceNumber};
 use pin_project_lite::pin_project;
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio::time::{interval, Interval};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
+use tracing::info;
 
-use crate::streams::{CloseEvent, Duplex, FanInSink, SessionHandler, StreamExtSplit};
+use crate::streams::{Duplex, FanInSink};
 
 
 
@@ -47,9 +46,7 @@ impl From<receive::HeartbeatAck> for HeartbeatManagerInput {
 
 impl From<Heartbeat> for GatewaySendEvent {
     fn from(value: Heartbeat) -> Self {
-        let heartbeat = send::Heartbeat{
-            d: value.latest_sequence_number
-        };
+        let heartbeat = send::Heartbeat(value.latest_sequence_number);
         GatewaySendEvent::Heartbeat(heartbeat)
     }
 }
@@ -63,45 +60,19 @@ impl From<Heartbeat> for Either<GatewaySendEvent, GatewayCloseEvent> {
 
 type Seq = Option<u64>;
 
-pub struct GatewaySession {
-    sequence_number: Seq,
-    resume_gateway_url: Option<String>,
-    token: String,
-    session_id: Option<String>,
-}
-
-impl GatewaySession {
-    fn new(token: String) -> GatewaySession {
-        GatewaySession {
-            sequence_number: None,
-            resume_gateway_url: None,
-            token,
-            session_id: None,
-        }
-    }
-}
-
-async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_session: Arc<RwLock<GatewaySession>>) -> Result<Either<GatewayRecvEvent, GatewayCloseEvent>, GatewayError> {
+fn decode_message(msg: Result<Message, tungstenite::Error>) -> Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError> {
 
     match msg {
         Ok(Message::Text(text)) => {
-            match serde_json::from_str::<RawGatewayPayload>(&text) {
-                Ok(raw) => {
-                    if raw.s.is_some() {
-                        let mut session_write = gateway_session.write().await;
-                        session_write.sequence_number = raw.s;
-                    }
-                    match TryInto::<GatewayRecvEvent>::try_into(raw) {
-                        Ok(event) => return Ok(Either::Left(event)),
-                        Err(e) => return Err(Into::<GatewayError>::into(e))
-                    }
-                },
-                Err(e) => return Err(Into::<GatewayError>::into(e))
-            }
+            info!(target: "gateway.recv", json = %text, "received gateway message");
+
+            return serde_json::from_str::<RawGatewayPayload>(&text)        
+                .map_err(Into::into)
+                .and_then(TryInto::try_into)
         },
         Ok(Message::Close(maybe_frame)) => {
             let close_event = Into::<GatewayCloseEvent>::into(maybe_frame);
-            return Ok(Either::Right(close_event))
+            return Ok(close_event.into())
         },
         Ok(msg) => {panic!("Received an unexpected message type from Discord gateway: {:?}", msg)},
         Err(e) => return Err(Into::<GatewayError>::into(e))
@@ -110,143 +81,246 @@ async fn decode_message(msg: Result<Message, tungstenite::Error>, gateway_sessio
 
 pub async fn create_connection(
     ws_connection: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, 
-    gateway_session: Arc<RwLock<GatewaySession>>
-) -> (Pin<Box<dyn Sink<Either<GatewaySendEvent, GatewayCloseEvent>, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<Either<GatewayRecvEvent, GatewayCloseEvent>, GatewayError>>>>) 
+) -> (Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>) 
 {
 
     let (outgoing, incoming) = ws_connection.split();
 
-    let decoder = {
-        let session_clone = gateway_session.clone();
-        move |msg| {
-            let session = session_clone.clone();
-            async move {
-                decode_message(msg, session).await
-            }
-        }
-    };
-    let mut decoded = Box::pin(incoming.then(decoder));
+    let mut decoded = Box::pin(incoming.map(decode_message));
 
     let hello = match decoded.next().await
         .expect("Websocket should not close")
         .expect("Websocket should not error")
         {
-            Either::Left(GatewayRecvEvent::Hello(h)) => h,
-            Either::Left(_) => panic!("Received a gateway event other than Hello"),
-            Either::Right(c) => panic!("Gateway closed immediately: {:?}", c)
+            GatewayIncoming::Recv(recv) => {
+                match recv.into_inner() {
+                    GatewayRecvEvent::Hello(h) => h,
+                    _ => panic!("Received a gateway event other than Hello")
+                }
+            },
+            GatewayIncoming::Close(c) => panic!("Gateway closed immediately: {:?}", c)
         };
 
     let heartbeat_interval = hello.heartbeat_interval;
 
-    let (other, heartbeat_events) = decoded
-        .map(|item| {
-            match item {
-                Ok(Either::Left(GatewayRecvEvent::Heartbeat(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
-                Ok(Either::Left(GatewayRecvEvent::HeartbeatAck(event))) => Either::Right(Into::<HeartbeatManagerInput>::into(event)),
-                res => Either::Left(res),
-            }
-        })
-        .split_either();
 
-    let encoded = Box::pin(outgoing.with(|event: Either<GatewaySendEvent, GatewayCloseEvent>| async {
-        match event {
-            Either::Left(send) => Ok(send.into()),
-            Either::Right(close) => Ok(close.into()),
+    let encoded = Box::pin(outgoing.with(|event: GatewayOutgoing| async move {
+        let msg: Message = event.into();
+
+        match &msg {
+            Message::Text(text) => {
+                info!(json = %text, "sending websocket text message");
+            }
+            Message::Close(frame) => {
+                info!(?frame, "sending websocket close");
+            }
+            _ => {
+                info!(kind = ?msg, "sending websocket control frame");
+            }
         }
+
+        Ok(msg)
     }));
+
 
     let fan_in_encoded = FanInSink::new(encoded);
 
     let heartbeat_sink = fan_in_encoded.clone();
 
-    let heartbeat_manager = HeartbeatManager::new(heartbeat_sink, heartbeat_events, Duration::from_millis(heartbeat_interval), gateway_session.clone())
-        .map(|item| {
-            match item {
-                Ok(GatewayIncoming::Recv(recv)) => Ok(Either::Left(recv)),
-                Ok(GatewayIncoming::Close(close)) => Ok(Either::Right(close)),
-                Err(e) => Err(e)
-            }
-        });
+    let heartbeat_manager = HeartbeatManager::new(heartbeat_sink, decoded, Duration::from_millis(heartbeat_interval));
 
-    let final_stream = futures::stream::select(other, heartbeat_manager);
-
-    return (Box::pin(fan_in_encoded), Box::pin(final_stream))
+    return (Box::pin(fan_in_encoded), Box::pin(heartbeat_manager))
 }
 
-pub async fn resume_connection(session: Arc<RwLock<GatewaySession>>) -> Option<Duplex<Pin<Box<dyn Sink<Either<GatewaySendEvent, GatewayCloseEvent>, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<Either<GatewayRecvEvent, GatewayCloseEvent>, GatewayError>>>>, Either<GatewaySendEvent, GatewayCloseEvent>>> 
+pub async fn resume_connection(
+    resume_gateway_url: &str, 
+    token: &str, 
+    session_id: &str, 
+    sequence_number: u64
+) -> Option<(Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>)> 
 {
 
-    let session_read = session.read().await;
-
-    let request = session_read.resume_gateway_url.clone()
-        .expect("No resume url")
+    let request = resume_gateway_url
         .into_client_request()
         .expect("Invalid resume url");
 
     let (ws_connection, _response) = tokio_tungstenite::connect_async(request).await.unwrap();
 
-    let (mut sink, stream) = create_connection(ws_connection, session.clone()).await;
+    let (mut sink, stream) = create_connection(ws_connection).await;
 
 
 
-    let resume_event = Either::Left(GatewaySendEvent::Resume(
+    let resume_event = GatewayOutgoing::Send(GatewaySendEvent::Resume(
         send::Resume { 
-            token: session_read.token.clone(),
-            session_id: session_read.session_id.clone().expect("No session id"),
-            seq: session_read.sequence_number.expect("No sequence number"),
+            token: token.to_string(),
+            session_id: session_id.to_string(),
+            seq: sequence_number,
         }
     ));
 
     sink.send(resume_event.into()).await.unwrap();
 
-    let inner = Duplex::new(sink, stream);
-    Some(inner)
+    Some((sink, stream))
 }
 
-pub async fn connect_websocket(url: &str, token: &str)
+pub async fn connect_websocket(url: &str, token: &str) -> impl Sink<GatewayOutgoing, Error = GatewayError> + Stream<Item = Result<GatewayRecvEvent, GatewayError>>
 {
-    let gateway_session = Arc::new(RwLock::new(GatewaySession::new(token.to_string())));
-
     let (ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
 
-    let (gateway_sink, gateway_stream) = create_connection(ws_connection, gateway_session.clone()).await;
+    let (mut gateway_sink, mut gateway_stream) = create_connection(ws_connection).await;
 
-    let duplex = Duplex::new(gateway_sink, gateway_stream);
+    let identify = Identify {
+        token: token.to_string(),
+        properties: ClientProperties {
+            os: "Linux".to_string(),
+            browser: "my_library".to_string(),
+            device: "my_library".to_string(),
+        },
+        compress: None,
+        large_threshold: None,
+        shard: None,
+        presence: None,
+        intents: Intents::GUILDS.bits(),
+    };
 
-    let session_manager = SessionHandler::from_sink(duplex, move |mut inner, event| {
+    gateway_sink.send(GatewayOutgoing::Send(GatewaySendEvent::Identify(identify))).await.unwrap();
 
-        let gateway_session = gateway_session.clone();
+    let mut sequence_number = None;
+    let mut resume_gateway_url = "".to_string();
+    let mut session_id = "".to_string();
 
-        async move {
-            match event {
-                Some(CloseEvent::Internal(close)) => {
-                    let _ = inner.send(Either::Right(close)).await; 
-                    let _ = inner.close().await;
-                    return None
-                }
-                Some(CloseEvent::External(close)) => {
-                    if let Some(code) = close.close_code {
-                        if code.can_reconnect() {
-                            let new_inner = resume_connection(gateway_session.clone()).await.map(Box::pin);
-                            return new_inner
-                        }
-                    }
-
-                    return None
-                }
-                None => {
-                    let new_inner = resume_connection(gateway_session.clone()).await.map(Box::pin);
-                    return new_inner
-                }
+    match gateway_stream.next().await {
+        Some(Ok(GatewayIncoming::Recv(recv))) => {
+            sequence_number = recv.sequence_number();
+            match recv.into_inner() {
+                GatewayRecvEvent::Ready(ready) => {
+                    resume_gateway_url = ready.resume_gateway_url;
+                    session_id = ready.session_id;
+                },
+                _ => panic!("Unexpected event."),
             }
-        }
-    });
+        },
+        Some(Ok(GatewayIncoming::Close(close))) => panic!("Gateway closed during identify {:?}", close),
+        Some(Err(e)) => panic!("Error occured during identify: {:?}", e),
+        None => panic!("Stream ended unexpectedly")
+    }
 
-    todo!()
+    let close_manager = CloseManager::new(Duplex::new(gateway_sink, gateway_stream), &resume_gateway_url, &token, &session_id, sequence_number.unwrap());
+
+    return close_manager
 }
 
 
+type Inner = Duplex<Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>, GatewayOutgoing>;
 
+#[pin_project::pin_project()]
+pub struct CloseManager {
+    #[pin]
+    inner: Inner,
+    inner_fut: Option<Pin<Box<dyn Future<Output = Option<Inner>>>>>,
+
+    resume_gateway_url: String,
+    token: String,
+    session_id: String,
+    sequence_number: u64,
+}
+
+impl CloseManager {
+    pub fn new(inner: Inner, resume_gateway_url: &str, token: &str, session_id: &str, sequence_number: u64) -> Self {
+        Self { 
+            inner, 
+            inner_fut: None, 
+            resume_gateway_url: resume_gateway_url.to_string(), 
+            token: token.to_string(), 
+            session_id: session_id.to_string(), 
+            sequence_number
+        }
+    }
+}
+
+impl Stream for CloseManager 
+{
+    type Item = Result<GatewayRecvEvent, GatewayError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        loop {
+            
+            if let Some(fut) = this.inner_fut {
+                if let Some(new_inner) = ready!(fut.poll_unpin(cx)) {
+                    *this.inner = new_inner;
+                    *this.inner_fut = None;
+                } else {
+                    return Poll::Ready(Some(Err(GatewayError::ResumeError)))
+                };
+            }
+
+            match ready!(this.inner.as_mut().poll_next(cx)) {
+                None => return Poll::Ready(None),
+                Some(Ok(GatewayIncoming::Recv(recv))) => {
+                    if let Some(sequence_number) = recv.sequence_number() {
+                        *this.sequence_number = sequence_number;
+                    }
+                    return Poll::Ready(Some(Ok(recv.into_inner())))
+                }
+                Some(Ok(GatewayIncoming::Close(close))) => {
+                    if close.can_reconnect() {
+                        let sequence_number = *this.sequence_number;
+                        let resume_gateway_url = this.resume_gateway_url.clone();
+                        let token = this.token.clone();
+                        let session_id = this.session_id.clone();
+                        *this.inner_fut = Some(Box::pin(async move {
+                            resume_connection(&resume_gateway_url, &token, &session_id.clone(), sequence_number)
+                                .await
+                                .map(|(sink, stream)| {
+                                    Duplex::new(sink, stream)
+                                })
+                        }));
+                        continue
+                    } else {
+                        return Poll::Ready(Some(Err(GatewayError::Closed(close.close_code.unwrap()))))
+                    }
+                }
+                Some(Err(GatewayError::HeartbeatError(_))) => {
+                    let sequence_number = *this.sequence_number;
+                    let resume_gateway_url = this.resume_gateway_url.clone();
+                    let token = this.token.clone();
+                    let session_id = this.session_id.clone();
+                    *this.inner_fut = Some(Box::pin(async move {
+                        resume_connection(&resume_gateway_url, &token, &session_id.clone(), sequence_number)
+                            .await
+                            .map(|(sink, stream)| {
+                                Duplex::new(sink, stream)
+                            })
+                    }));
+                    continue
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e)))
+            }
+        }
+    }
+}
+
+impl Sink<GatewayOutgoing> for CloseManager {
+    type Error = GatewayError;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: GatewayOutgoing) -> Result<(), Self::Error> {
+        self.project().inner.start_send(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_close(cx)
+    }
+}
 
 
 #[derive(Debug)]
@@ -269,68 +343,59 @@ pub enum HeartbeatManagerInput {
     HeartbeatAck(HeartbeatAck),
 }
 
+struct MaybeHeartbeatManagerInput(Option<HeartbeatManagerInput>);
+
+impl From<GatewayRecvEvent> for MaybeHeartbeatManagerInput {
+    fn from(value: GatewayRecvEvent) -> Self {
+        let opt = match value {
+            GatewayRecvEvent::Heartbeat(heartbeat) => Some(HeartbeatManagerInput::Heartbeat(heartbeat.into())),
+            GatewayRecvEvent::HeartbeatAck(ack) => Some(HeartbeatManagerInput::HeartbeatAck(ack.into())),
+            _ => None
+        };
+        MaybeHeartbeatManagerInput(opt)
+    }
+}
+
 pin_project! {
-    pub struct HeartbeatManager<Si, S, SinkItem> 
+    pub struct HeartbeatManager<Si, S> 
     where
-        Si: Sink<SinkItem>,
+        Si: Sink<GatewayOutgoing>,
     {
         #[pin]
         sink: Si,
-        send_queue: VecDeque<SinkItem>,
+        send_queue: VecDeque<GatewayOutgoing>,
         #[pin]
         incoming: S,
         #[pin]
         interval: Interval,
         ack_received: bool,
-
-        session: Arc<RwLock<GatewaySession>>,
-        #[pin]
-        session_lock_fut: Option<Pin<Box<dyn Future<Output = OwnedRwLockReadGuard<GatewaySession>>>>>,
-
-        _marker: PhantomData<SinkItem>,
+        sequence_number: Seq,
     }
 }
 
-impl<Si, S, SinkItem> HeartbeatManager<Si, S, SinkItem> 
+impl<Si, S> HeartbeatManager<Si, S> 
 where 
-    Si: Sink<SinkItem>
+    Si: Sink<GatewayOutgoing>
 {
-    pub fn new(sink: Si, incoming: S, heartbeat_interval: Duration, session: Arc<RwLock<GatewaySession>>) -> Self {
+    pub fn new(sink: Si, incoming: S, heartbeat_interval: Duration) -> Self {
         HeartbeatManager { 
             sink,
             send_queue: VecDeque::new(),
             incoming, 
             interval: interval(heartbeat_interval), 
             ack_received: true,
-            session,
-            session_lock_fut: None,
-            _marker: PhantomData
+            sequence_number: None,
         }
-    }
-
-    fn get_latest_session_number(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Seq> {
-        let mut this = self.project();
-
-        if this.session_lock_fut.is_none() {
-            *this.session_lock_fut = Some(this.session.clone().read_owned().boxed());
-        }
-
-        let fut = this.session_lock_fut.as_pin_mut().unwrap();
-        let read_guard = ready!(fut.poll(cx));
-
-        return Poll::Ready(read_guard.sequence_number)
     }
 }
 
-impl<Si, S, SinkItem, Item> Stream for HeartbeatManager<Si, S, SinkItem> 
+impl<Si, S> Stream for HeartbeatManager<Si, S> 
 where 
-    S: Stream<Item = Item>,
-    Si: Sink<SinkItem>,
-    Item: Into<HeartbeatManagerInput>,
-    Heartbeat: Into<SinkItem>,
-    Si::Error: Into<GatewayError>,
+    S: Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>,
+    Si: Sink<GatewayOutgoing>,
+    GatewayError: From<Si::Error>,
 {
-    type Item = Result<GatewayIncoming, GatewayError>;
+    type Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>;
 
     fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
 
@@ -338,32 +403,41 @@ where
             let mut this = self.as_mut().project();
 
             while !this.send_queue.is_empty() {
-                ready!(this.sink.as_mut().poll_ready(cx));
+                ready!(this.sink.as_mut().poll_ready(cx))?;
                 let sink_item = this.send_queue.pop_front().unwrap();
                 match this.sink.as_mut().start_send(sink_item) {
                     Ok(()) => {},
                     Err(e) => return Poll::Ready(Some(Err(Into::<GatewayError>::into(e))))
                 }
             }
-            ready!(this.sink.as_mut().poll_flush(cx));
-
-            let latest_sequence_number = ready!(self.as_mut().get_latest_session_number(cx));
+            ready!(this.sink.as_mut().poll_ready(cx))?;
+            ready!(this.sink.as_mut().poll_flush(cx))?;
 
             let mut this = self.as_mut().project();
 
             match this.incoming.as_mut().poll_next(cx) {
                 Poll::Pending => {},
                 Poll::Ready(Some(item)) => {
-                    match item.into() {
-                        HeartbeatManagerInput::HeartbeatAck(_ack) => {
-                            *this.ack_received = true;
+                    match item {
+                        Ok(GatewayIncoming::Recv(recv)) => {
+                            *this.sequence_number = recv.sequence_number();
+                            match recv.inner_ref() {
+                                GatewayRecvEvent::HeartbeatAck(_ack) => {
+                                    *this.ack_received = true;
+                                },
+                                GatewayRecvEvent::Heartbeat(_heartbeat) => {
+                                    this.interval.reset();
+                                    *this.ack_received = false;
+                                    this.send_queue.push_back(GatewayOutgoing::Send(Heartbeat::new(*this.sequence_number).into()));
+                                    continue
+                                },
+                                _ => {
+                                    return Poll::Ready(Some(Ok(GatewayIncoming::Recv(recv))))
+                                }
+                            }
                         },
-                        HeartbeatManagerInput::Heartbeat(_heartbeat) => {
-                            this.interval.reset();
-                            *this.ack_received = false;
-                            this.send_queue.push_back(Heartbeat::new(latest_sequence_number).into());
-                            continue
-                        },
+                        Ok(GatewayIncoming::Close(c)) => return Poll::Ready(Some(Ok(GatewayIncoming::Close(c)))),
+                        Err(e) => return Poll::Ready(Some(Err(e))),
                     }
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
@@ -374,7 +448,7 @@ where
                 Poll::Ready(_instant) => {
                     if *this.ack_received {
                         *this.ack_received = false;
-                        this.send_queue.push_back(Heartbeat::new(latest_sequence_number).into());
+                        this.send_queue.push_back(GatewayOutgoing::Send(Heartbeat::new(*this.sequence_number).into()));
                     } else {
                         return Poll::Ready(Some(Err(HeartbeatError {}.into())))
                     }
@@ -384,56 +458,36 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::StreamExt;
-    use tokio::time::{advance, sleep, Duration};
-    use tokio_stream::wrappers::ReceiverStream;
 
-    #[tokio::test(start_paused = true)] // <-- IMPORTANT: we control time
-    async fn test_heartbeat_manager_emits_heartbeats_and_handles_acks() {
-        // incoming acks (empty at first)
-        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel(10);
-        let incoming_stream = ReceiverStream::new(ack_rx);
+#[tokio::test]
+async fn connect_to_gateway() {
 
-        // create the heartbeat stream
-        let mut hb_stream = HeartbeatManager::new(incoming_stream, Duration::from_secs(1));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
 
-        advance(Duration::from_millis(1)).await;
-        let first = hb_stream.next().await.expect("expected heartbeat");
-        println!("First: {:?}", &first);
-        assert!(first.is_ok(), "first event should be Ok(Heartbeat)");
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install default rustls crypto provider");
 
-        //
-        // ---- Send an ack BEFORE the next timeout ----
-        //
-        ack_tx.send(HeartbeatManagerInput::HeartbeatAck(HeartbeatAck {  })).await.unwrap();
+    let gateway_url = reqwest::get("https://discord.com/api/v10/gateway")
+        .await.unwrap()
+        .json::<serde_json::Value>()
+        .await.unwrap()["url"]
+        .as_str().unwrap()
+        .to_string();
 
-        // Tick the clock so the next heartbeat is generated
-        advance(Duration::from_secs(1)).await;
+    dotenvy::dotenv().unwrap();
+    let token: &str = &std::env::var("GATEWAY_TOKEN").expect("Could not find token.");
 
-        let second = hb_stream.next().await.expect("expected second heartbeat");
-        println!("Second: {:?}", &second);
-        assert!(second.is_ok(), "second event should also be Ok(Heartbeat)");
+    let mut connection = connect_websocket(&gateway_url, token).await;
 
-        // Send heartbeat so the next heartbeat is generated early
-        advance(Duration::from_millis(200)).await;
-        ack_tx.send(HeartbeatManagerInput::Heartbeat(Heartbeat {  })).await.unwrap();
+    println!("Connection established");
 
-        let third = hb_stream.next().await.expect("expected third heartbeat");
-        println!("Third: {:?}", &third);
-        assert!(third.is_ok(), "third event should also be Ok(Heartbeat)");
+    connection.close().await.expect("Failed to close connection");
 
-        //
-        // ---- Advance time long enough for a timeout event ----
-        //
-        advance(Duration::from_secs(2)).await;
-
-        let fourth = hb_stream.next().await.expect("expected timeout event");
-        println!("Fourth: {:?}", &fourth);
-        assert!(fourth.is_err(), "expected Err(HeartbeatError)");
-    }
+    println!("Connection closed");
 }
+
+
 
 

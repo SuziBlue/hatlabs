@@ -5,7 +5,7 @@ use tokio::sync::{Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub trait DiscordData: Send + Sync + 'static {}
 
-struct NotifyWriteGuard<'a, T> {
+pub struct NotifyWriteGuard<'a, T> {
     guard: RwLockWriteGuard<'a, T>,
     notify: Arc<Notify>
 }

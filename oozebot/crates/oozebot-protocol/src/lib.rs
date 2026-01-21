@@ -1,3 +1,5 @@
+use close_codes::GatewayCloseCode;
+use events::dispatch::DispatchEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -8,7 +10,33 @@ pub mod close_codes;
 pub mod events;
 pub mod intents;
 
+type Seq = Option<u64>;
 
+pub struct WithSequenceNumber<T> {
+    inner: T,
+    sequence_number: Seq,
+}
+
+impl<T> WithSequenceNumber<T> {
+    pub fn wrap(inner: T, sequence_number: Seq) -> Self {
+        Self { inner, sequence_number }
+    }
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+    pub fn inner_ref(&self) -> &T {
+        &self.inner
+    }
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+    pub fn sequence_number(&self) -> Seq {
+        self.sequence_number
+    }
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> WithSequenceNumber<U> {
+        WithSequenceNumber { inner: f(self.inner), sequence_number: self.sequence_number }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum GatewayError {
@@ -20,19 +48,25 @@ pub enum GatewayError {
     WebSocketError(#[from] tungstenite::Error),
     #[error("Heartbeat error: {0}")]
     HeartbeatError(#[from] HeartbeatError),
+    #[error("Connection closed by server with code: {:?}", 0)]
+    Closed(GatewayCloseCode),
+    #[error("Failed to resume connection")]
+    ResumeError,
+    #[error("Protocol error: {0}")]
+    ProtocolError(String),
 }
 
 #[derive(Error, Debug)]
 #[error("Heartbeat Timeout")]
 pub struct HeartbeatError {}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct RawGatewayPayload {
     op: u8,
     #[serde(default)]
     d: Value,
     pub s: Option<u64>,
-    pub t: Option<String>,
+    pub t: Option<DispatchEvent>,
 }
 
 #[cfg(test)]

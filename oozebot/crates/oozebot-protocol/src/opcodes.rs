@@ -1,11 +1,11 @@
 use serde::{Serialize, Deserialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use crate::GatewayError;
 
 
 /// Gateway operation codes used in the Discord Gateway API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
-#[serde(try_from = "u8")]
 pub enum GatewayOpCode {
     /// 0 - An event was dispatched.
     Dispatch = 0,

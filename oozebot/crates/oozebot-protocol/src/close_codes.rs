@@ -2,7 +2,7 @@
 use std::u16;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+use tokio_tungstenite::tungstenite::{protocol::{frame::coding::CloseCode, CloseFrame}, Message};
 
 
 /// Discord Gateway Close Codes
@@ -128,4 +128,42 @@ impl<'de> Deserialize<'de> for GatewayCloseCode {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd)]
+pub struct GatewayCloseEvent {
+    pub close_code: Option<GatewayCloseCode>,
+    pub reason: String,
+}
 
+impl GatewayCloseEvent {
+    pub fn can_reconnect(&self) -> bool {
+        if let Some(code) = self.close_code {
+            code.can_reconnect()
+        } else {
+            true
+        }
+    }
+}
+
+impl From<Option<CloseFrame>> for GatewayCloseEvent {
+    fn from(value: Option<CloseFrame>) -> Self {
+        match value {
+            Some(close_frame) => GatewayCloseEvent { close_code: Some(close_frame.code.into()), reason: close_frame.reason.to_string() },
+            None => GatewayCloseEvent { close_code: None, reason: "".to_string() }
+        }
+    }
+}
+
+impl From<GatewayCloseEvent> for Message {
+    fn from(value: GatewayCloseEvent) -> Self {
+        Message::Close(value.into())
+    }
+}
+
+impl From<GatewayCloseEvent> for Option<CloseFrame> {
+    fn from(value: GatewayCloseEvent) -> Self {
+        match value.close_code {
+            Some(code) => Some(CloseFrame { code: code.into(), reason: value.reason.into() }),
+            None => None
+        }
+    }
+}
