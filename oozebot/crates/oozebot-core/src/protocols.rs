@@ -11,9 +11,11 @@ use oozebot_protocol::events::send::{self, ClientProperties, GatewayOutgoing, Ga
 use oozebot_protocol::intents::Intents;
 use oozebot_protocol::{GatewayError, HeartbeatError, RawGatewayPayload, WithSequenceNumber};
 use pin_project_lite::pin_project;
-use tokio::time::{interval, interval_at, Instant, Interval};
+use tokio::net::TcpStream;
+use tokio::time::{interval, Interval};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::info;
 
 use crate::streams::{Duplex, FanInSink};
@@ -60,84 +62,102 @@ impl From<Heartbeat> for Either<GatewaySendEvent, GatewayCloseEvent> {
 
 type Seq = Option<u64>;
 
-fn decode_message(msg: Result<Message, tungstenite::Error>) -> Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError> {
+pub type WebSocketConnection = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-    match msg {
-        Ok(Message::Text(text)) => {
-            info!(target: "gateway.recv", json = %text, "received gateway message");
-
-            return serde_json::from_str::<RawGatewayPayload>(&text)        
-                .map_err(Into::into)
-                .and_then(TryInto::try_into)
-        },
-        Ok(Message::Close(maybe_frame)) => {
-            let close_event = Into::<GatewayCloseEvent>::into(maybe_frame);
-            return Ok(close_event.into())
-        },
-        Ok(msg) => {panic!("Received an unexpected message type from Discord gateway: {:?}", msg)},
-        Err(e) => return Err(Into::<GatewayError>::into(e))
-    };
-}
-
-pub async fn create_connection(
-    ws_connection: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, 
-) -> (Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>) 
+pub async fn connect_websocket(url: &str) -> WebSocketConnection
 {
+    let (ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
 
-    let (outgoing, incoming) = ws_connection.split();
-
-    let mut decoded = Box::pin(incoming.map(decode_message));
-
-    let hello = match decoded.next().await
-        .expect("Websocket should not close")
-        .expect("Websocket should not error")
-        {
-            GatewayIncoming::Recv(recv) => {
-                match recv.into_inner() {
-                    GatewayRecvEvent::Hello(h) => h,
-                    _ => panic!("Received a gateway event other than Hello")
-                }
-            },
-            GatewayIncoming::Close(c) => panic!("Gateway closed immediately: {:?}", c)
-        };
-
-    let heartbeat_interval = hello.heartbeat_interval;
-
-
-    let encoded = Box::pin(outgoing.with(|event: GatewayOutgoing| async move {
-        let msg: Message = event.into();
-
-        match &msg {
-            Message::Text(text) => {
-                info!(json = %text, "sending websocket text message");
-            }
-            Message::Close(frame) => {
-                info!(?frame, "sending websocket close");
-            }
-            _ => {
-                info!(kind = ?msg, "sending websocket control frame");
-            }
-        }
-
-        Ok(msg)
-    }));
-
-
-    let fan_in_encoded = FanInSink::new(encoded);
-
-    let heartbeat_sink = fan_in_encoded.clone();
-
-    let heartbeat_manager = HeartbeatManager::new(heartbeat_sink, decoded, Duration::from_millis(heartbeat_interval));
-
-    return (Box::pin(fan_in_encoded), Box::pin(heartbeat_manager))
+    ws_connection
 }
+
+pub type GatewayConnectionConnected = Duplex<
+    Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, 
+    Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>,
+>;
+
+trait CreateConnection<E>: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Sized + 'static 
+where 
+    GatewayError: From<E>,
+{
+    async fn create_connection(
+        self, 
+    ) -> GatewayConnectionConnected
+    {
+
+        let (outgoing, incoming) = self.split();
+
+        let mut decoded = Box::pin(incoming.map(|msg| {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    info!(target: "gateway.recv", json = %text, "received gateway message");
+
+                    return serde_json::from_str::<RawGatewayPayload>(&text)        
+                        .map_err(Into::into)
+                        .and_then(TryInto::try_into)
+                },
+                Ok(Message::Close(maybe_frame)) => {
+                    let close_event = Into::<GatewayCloseEvent>::into(maybe_frame);
+                    return Ok(close_event.into())
+                },
+                Ok(msg) => {panic!("Received an unexpected message type from Discord gateway: {:?}", msg)},
+                Err(e) => return Err(Into::<GatewayError>::into(e))
+            };
+        }));
+
+        let hello = match decoded.next().await
+            .expect("Websocket should not close")
+            .expect("Websocket should not error")
+            {
+                GatewayIncoming::Recv(recv) => {
+                    match recv.into_inner() {
+                        GatewayRecvEvent::Hello(h) => h,
+                        _ => panic!("Received a gateway event other than Hello")
+                    }
+                },
+                GatewayIncoming::Close(c) => panic!("Gateway closed immediately: {:?}", c)
+            };
+
+        let heartbeat_interval = hello.heartbeat_interval;
+
+
+        let encoded = Box::pin(outgoing.with(|event: GatewayOutgoing| async move {
+            let msg: Message = event.into();
+
+            match &msg {
+                Message::Text(text) => {
+                    info!(json = %text, "sending websocket text message");
+                }
+                Message::Close(frame) => {
+                    info!(?frame, "sending websocket close");
+                }
+                _ => {
+                    info!(kind = ?msg, "sending websocket control frame");
+                }
+            }
+
+            Ok(msg)
+        }));
+
+
+        let fan_in_encoded = FanInSink::new(encoded);
+
+        let heartbeat_sink = fan_in_encoded.clone();
+
+        let heartbeat_manager = HeartbeatManager::new(heartbeat_sink, decoded, Duration::from_millis(heartbeat_interval));
+
+        return Duplex::new(Box::pin(fan_in_encoded), Box::pin(heartbeat_manager))
+    }
+}
+
+impl CreateConnection<tungstenite::error::Error> for WebSocketConnection {}
 
 pub async fn resume_connection(
     resume_gateway_url: &str, 
     token: &str, 
     session_id: &str, 
     sequence_number: u64
-) -> Option<(Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>)> 
+) -> Option<GatewayConnectionConnected> 
 {
 
     let request = resume_gateway_url
@@ -146,7 +166,7 @@ pub async fn resume_connection(
 
     let (ws_connection, _response) = tokio_tungstenite::connect_async(request).await.unwrap();
 
-    let (mut sink, stream) = create_connection(ws_connection).await;
+    let mut connection = ws_connection.create_connection().await;
 
 
 
@@ -158,63 +178,70 @@ pub async fn resume_connection(
         }
     ));
 
-    sink.send(resume_event.into()).await.unwrap();
+    connection.send(resume_event.into()).await.unwrap();
 
-    Some((sink, stream))
+    Some(connection)
 }
 
-pub async fn connect_websocket(url: &str, token: &str) -> impl Sink<GatewayOutgoing, Error = GatewayError> + Stream<Item = Result<GatewayRecvEvent, GatewayError>>
+pub type GatewayConnectionIdentified<C> = CloseManager<C>;
+
+trait IdentifyGatewayConnection<E>: 
+    Sink<GatewayOutgoing, Error = E> + 
+    Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>> + 
+    Unpin + 
+    Sized
+where 
+    E: std::fmt:: Debug,
 {
-    let (ws_connection, _response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    async fn identify_gateway_connection(mut self, token: &str) -> GatewayConnectionIdentified<Self>
+    {
 
-    let (mut gateway_sink, mut gateway_stream) = create_connection(ws_connection).await;
+        let identify = Identify {
+            token: token.to_string(),
+            properties: ClientProperties {
+                os: "Linux".to_string(),
+                browser: "my_library".to_string(),
+                device: "my_library".to_string(),
+            },
+            compress: None,
+            large_threshold: None,
+            shard: None,
+            presence: None,
+            intents: Intents::GUILDS.bits(),
+        };
 
-    let identify = Identify {
-        token: token.to_string(),
-        properties: ClientProperties {
-            os: "Linux".to_string(),
-            browser: "my_library".to_string(),
-            device: "my_library".to_string(),
-        },
-        compress: None,
-        large_threshold: None,
-        shard: None,
-        presence: None,
-        intents: Intents::GUILDS.bits(),
-    };
+        self.send(GatewayOutgoing::Send(GatewaySendEvent::Identify(identify))).await.unwrap();
 
-    gateway_sink.send(GatewayOutgoing::Send(GatewaySendEvent::Identify(identify))).await.unwrap();
+        let sequence_number: Option<u64>;
+        let resume_gateway_url: String;
+        let session_id: String;
 
-    let sequence_number: Option<u64>;
-    let resume_gateway_url: String;
-    let session_id: String;
+        match self.next().await {
+            Some(Ok(GatewayIncoming::Recv(recv))) => {
+                sequence_number = recv.sequence_number();
+                match recv.into_inner() {
+                    GatewayRecvEvent::Ready(ready) => {
+                        resume_gateway_url = ready.resume_gateway_url;
+                        session_id = ready.session_id;
+                    },
+                    _ => panic!("Unexpected event."),
+                }
+            },
+            Some(Ok(GatewayIncoming::Close(close))) => panic!("Gateway closed during identify {:?}", close),
+            Some(Err(e)) => panic!("Error occured during identify: {:?}", e),
+            None => panic!("Stream ended unexpectedly")
+        }
 
-    match gateway_stream.next().await {
-        Some(Ok(GatewayIncoming::Recv(recv))) => {
-            sequence_number = recv.sequence_number();
-            match recv.into_inner() {
-                GatewayRecvEvent::Ready(ready) => {
-                    resume_gateway_url = ready.resume_gateway_url;
-                    session_id = ready.session_id;
-                },
-                _ => panic!("Unexpected event."),
-            }
-        },
-        Some(Ok(GatewayIncoming::Close(close))) => panic!("Gateway closed during identify {:?}", close),
-        Some(Err(e)) => panic!("Error occured during identify: {:?}", e),
-        None => panic!("Stream ended unexpectedly")
+        let close_manager = CloseManager::new(self, &resume_gateway_url, &token, &session_id, sequence_number.unwrap());
+
+        return close_manager
     }
-
-    let close_manager = CloseManager::new(Duplex::new(gateway_sink, gateway_stream), &resume_gateway_url, &token, &session_id, sequence_number.unwrap());
-
-    return close_manager
 }
 
-
-type Inner = Duplex<Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>, GatewayOutgoing>;
+impl IdentifyGatewayConnection<GatewayError> for GatewayConnectionConnected {}
 
 #[pin_project::pin_project()]
-pub struct CloseManager {
+pub struct CloseManager<Inner> {
     #[pin]
     inner: Inner,
     inner_fut: Option<Pin<Box<dyn Future<Output = Option<Inner>>>>>,
@@ -225,7 +252,7 @@ pub struct CloseManager {
     sequence_number: u64,
 }
 
-impl CloseManager {
+impl<Inner> CloseManager<Inner> {
     pub fn new(inner: Inner, resume_gateway_url: &str, token: &str, session_id: &str, sequence_number: u64) -> Self {
         Self { 
             inner, 
@@ -238,7 +265,7 @@ impl CloseManager {
     }
 }
 
-impl Stream for CloseManager 
+impl Stream for CloseManager<GatewayConnectionConnected>
 {
     type Item = Result<GatewayRecvEvent, GatewayError>;
 
@@ -273,9 +300,6 @@ impl Stream for CloseManager
                         *this.inner_fut = Some(Box::pin(async move {
                             resume_connection(&resume_gateway_url, &token, &session_id.clone(), sequence_number)
                                 .await
-                                .map(|(sink, stream)| {
-                                    Duplex::new(sink, stream)
-                                })
                         }));
                         continue
                     } else {
@@ -290,9 +314,6 @@ impl Stream for CloseManager
                     *this.inner_fut = Some(Box::pin(async move {
                         resume_connection(&resume_gateway_url, &token, &session_id.clone(), sequence_number)
                             .await
-                            .map(|(sink, stream)| {
-                                Duplex::new(sink, stream)
-                            })
                     }));
                     continue
                 }
@@ -302,7 +323,7 @@ impl Stream for CloseManager
     }
 }
 
-impl Sink<GatewayOutgoing> for CloseManager {
+impl Sink<GatewayOutgoing> for CloseManager<GatewayConnectionConnected> {
     type Error = GatewayError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -462,6 +483,42 @@ where
 }
 
 
+
+type TestHarness<St, Si, SiItem, Fut1, F1, Fut2, F2> = Duplex<futures::sink::With<Si, SiItem, SiItem, Fut1, F1>, futures::stream::Then<St, Fut2, F2>>;
+
+struct TestHarnessBuilder;
+
+impl TestHarnessBuilder {
+    pub fn new<St, Si, StItem, SiItem, E, Fut1, F1, Fut2, F2>(
+        f1: F1,
+        f2: F2,
+        sink: Si,
+        stream: St,
+    ) -> TestHarness<St, Si, SiItem, Fut1, F1, Fut2, F2>
+    where
+        St: Stream<Item = StItem>,
+        Si: Sink<SiItem, Error = E>,
+        Fut1: Future<Output = Result<SiItem, E>>,
+        Fut2: Future<Output = StItem>,
+        F1: FnMut(SiItem) -> Fut1,
+        F2: FnMut(StItem) -> Fut2,
+    {
+        Duplex::new(sink.with(f1), stream.then(f2))
+    }
+}
+
+
+impl<St, Si, Fut1, F1, Fut2, F2> CreateConnection<tokio_tungstenite::tungstenite::Error> for TestHarness<St, Si, Message, Fut1, F1, Fut2, F2> 
+where 
+    St: Stream + 'static,
+    Si: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + 'static,
+    Fut1: Future<Output = Result<Message, tokio_tungstenite::tungstenite::Error>> + 'static,
+    Fut2: Future<Output = Result<Message, tokio_tungstenite::tungstenite::Error>> + 'static,
+    F1: FnMut(Message) -> Fut1 + 'static,
+    F2: FnMut(St::Item) -> Fut2 + 'static,
+
+{}
+
 #[tokio::test]
 async fn connect_to_gateway() {
 
@@ -482,7 +539,30 @@ async fn connect_to_gateway() {
     dotenvy::dotenv().unwrap();
     let token: &str = &std::env::var("GATEWAY_TOKEN").expect("Could not find token.");
 
-    let mut connection = connect_websocket(&gateway_url, token).await;
+    let (ws_sink, ws_stream) = connect_websocket(&gateway_url)
+        .await
+        .split();
+
+    let test_outgoing = |msg: Message| async {
+        Ok(msg)
+    };
+
+    let test_incoming = |msg: Result<Message, tokio_tungstenite::tungstenite::Error>| async {
+        msg
+    };
+
+    let test_harness = TestHarnessBuilder::new(
+        test_outgoing, 
+        test_incoming, 
+        ws_sink, 
+        ws_stream
+    );
+
+    let mut connection = test_harness 
+        .create_connection()
+        .await
+        .identify_gateway_connection(token)
+        .await;
 
     println!("Connection established");
 

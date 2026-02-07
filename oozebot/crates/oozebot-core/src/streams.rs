@@ -679,26 +679,21 @@ where
 }
 
 pin_project! {
-    pub struct Duplex<Si, St, Item> {
+    pub struct Duplex<Si, St> {
         #[pin]
         sink: Si,
         #[pin]
         stream: St,
-        _marker: PhantomData<Item>,
     }
 }
 
-impl<Si, St, Item> Duplex<Si, St, Item> 
-where 
-    Si: Sink<Item>,
-    St: Stream,
-{
+impl<Si, St> Duplex<Si, St> {
     pub fn new(sink: Si, stream: St) -> Self {
-        Duplex { sink, stream, _marker: PhantomData }
+        Duplex { sink, stream }
     }
 }
 
-impl<Si, St, Item> Sink<Item> for Duplex<Si, St, Item>
+impl<Si, St, Item> Sink<Item> for Duplex<Si, St>
 where 
     Si: Sink<Item>,
 {
@@ -721,7 +716,7 @@ where
     }
 }
 
-impl<Si, St, Item> Stream for Duplex<Si, St, Item>
+impl<Si, St> Stream for Duplex<Si, St>
 where 
     St: Stream,
 {
