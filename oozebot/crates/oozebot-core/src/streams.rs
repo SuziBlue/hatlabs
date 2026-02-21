@@ -741,8 +741,6 @@ pin_project! {
     pub struct FanInSink<Si, Item> 
     {
         inner_sink: Arc<Mutex<Si>>,
-        open_peers: AtomicUsize,
-        state: FanInSinkState,
         #[pin]
         lock: Option<Either<OwnedMutexLockFuture<Si>, OwnedMutexGuard<Si>>>,
         _marker: PhantomData<Item>,
@@ -756,8 +754,6 @@ where
     pub fn new(sink: Si) -> Self {
         FanInSink { 
             inner_sink: Arc::new(Mutex::new(sink)), 
-            open_peers: AtomicUsize::new(1),
-            state: FanInSinkState::Open,
             lock: None, 
             _marker: PhantomData }
     }
@@ -798,14 +794,11 @@ where
 impl<Si, Item> Clone for FanInSink<Si, Item> 
 {
     fn clone(&self) -> Self {
-        let open_peers = self.open_peers.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-
         FanInSink { 
             inner_sink: self.inner_sink.clone(), 
-            open_peers: open_peers.into(),
-            state: FanInSinkState::Open,
             lock: None, 
-            _marker: PhantomData }
+            _marker: PhantomData 
+        }
     }
 }
 
@@ -862,38 +855,21 @@ where
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
 
-        loop {
-            match self.state {
-                FanInSinkState::Open => {
-                    self.state = FanInSinkState::Closing;
-                    if self.open_peers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) > 1 {
-                        *self.as_mut().project().lock = None;
-                        self.state = FanInSinkState::Closed;
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                FanInSinkState::Closing => {
-                    let mut sink = ready!(self.as_mut().acquire_lock(cx));
-                    match sink.poll_close_unpin(cx) {
-                        Poll::Pending => {
-                            self.as_mut().return_sink(sink);
-                            return Poll::Pending;
-                        },
-                        Poll::Ready(Ok(())) => {
-                            self.state = FanInSinkState::Closed;
-                            return Poll::Ready(Ok(()))
-                        },
-                        Poll::Ready(Err(e)) => {
-                            self.state = FanInSinkState::Closed;
-                            return Poll::Ready(Err(e))
-                        }
-                    }
-                }
-                FanInSinkState::Closed => {
-                    return Poll::Ready(Ok(()))
-                }
+
+        let mut sink = ready!(self.as_mut().acquire_lock(cx));
+        match sink.poll_close_unpin(cx) {
+            Poll::Pending => {
+                self.as_mut().return_sink(sink);
+                return Poll::Pending;
+            },
+            Poll::Ready(Ok(())) => {
+                return Poll::Ready(Ok(()))
+            },
+            Poll::Ready(Err(e)) => {
+                return Poll::Ready(Err(e))
             }
         }
+
     }
 }
 
@@ -916,7 +892,7 @@ where
                 let inner = ready!(fut.poll(cx));
                 unsafe {
                     let this = self.as_mut().get_unchecked_mut();
-                    mem::replace(this, CachedFuture::Avail(inner));
+                    let _ = mem::replace(this, CachedFuture::Avail(inner));
                 }
                 return Poll::Ready(());
             },

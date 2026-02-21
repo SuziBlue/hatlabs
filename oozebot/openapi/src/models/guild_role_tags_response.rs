@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GuildRoleTagsResponse {
     #[serde(rename = "premium_subscriber", skip_serializing_if = "Option::is_none")]
-    pub premium_subscriber: Option<models::Null>,
+    pub premium_subscriber: Option<()>,
     #[serde(rename = "bot_id", skip_serializing_if = "Option::is_none")]
     pub bot_id: Option<String>,
     #[serde(rename = "integration_id", skip_serializing_if = "Option::is_none")]
@@ -22,9 +22,9 @@ pub struct GuildRoleTagsResponse {
     #[serde(rename = "subscription_listing_id", skip_serializing_if = "Option::is_none")]
     pub subscription_listing_id: Option<String>,
     #[serde(rename = "available_for_purchase", skip_serializing_if = "Option::is_none")]
-    pub available_for_purchase: Option<models::Null>,
+    pub available_for_purchase: Option<()>,
     #[serde(rename = "guild_connections", skip_serializing_if = "Option::is_none")]
-    pub guild_connections: Option<models::Null>,
+    pub guild_connections: Option<()>,
 }
 
 impl GuildRoleTagsResponse {

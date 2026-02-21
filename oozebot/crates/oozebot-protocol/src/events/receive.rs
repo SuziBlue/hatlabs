@@ -1,7 +1,8 @@
 use serde::Deserialize;
+use serde_json::Value;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 
-use crate::{close_codes::GatewayCloseEvent, opcodes::GatewayOpCode, GatewayError, RawGatewayPayload, WithSequenceNumber};
+use crate::{close_codes::GatewayCloseEvent, opcodes::GatewayOpCode, resources::guild::{GuildCreate, UnavailableGuild}, BetterSerdeError, GatewayError, RawGatewayPayload, WithSequenceNumber};
 
 use super::dispatch::DispatchEvent;
 
@@ -24,13 +25,14 @@ impl TryFrom<Utf8Bytes> for GatewayRecvEvent {
 }
 
 
+#[derive(Debug)]
 pub enum GatewayIncoming<Recv, Close> {
     Recv(Recv),
     Close(Close),
 }
 
 
-#[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub enum GatewayRecvEvent {
     Hello(Hello),
     HeartbeatAck(HeartbeatAck),
@@ -39,6 +41,7 @@ pub enum GatewayRecvEvent {
     Reconnect(Reconnect),
     Resumed(Resumed),
     InvalidSession(InvalidSession),
+    Dispatch(Value),
 }
 
 impl TryFrom<RawGatewayPayload> for GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent> {
@@ -53,14 +56,14 @@ impl TryFrom<RawGatewayPayload> for GatewayIncoming<WithSequenceNumber<GatewayRe
 
         match opcode {
             GatewayOpCode::Hello => {
-                serde_json::from_value(raw.d)
+                serde_json::from_value(raw.d.clone())
                     .map(GatewayRecvEvent::Hello)
-                    .map_err(|e| e.into())
+                    .map_err(|e| Into::<BetterSerdeError>::into((e,&raw.d)).into())
             }
             GatewayOpCode::Heartbeat => {
-                serde_json::from_value(raw.d)
+                serde_json::from_value(raw.d.clone())
                     .map(GatewayRecvEvent::Heartbeat)
-                    .map_err(|e| e.into())
+                    .map_err(|e| Into::<BetterSerdeError>::into((e,&raw.d)).into())
             }
             GatewayOpCode::HeartbeatAck => {
                 Ok(GatewayRecvEvent::HeartbeatAck(HeartbeatAck))
@@ -69,9 +72,9 @@ impl TryFrom<RawGatewayPayload> for GatewayIncoming<WithSequenceNumber<GatewayRe
                 Ok(GatewayRecvEvent::Reconnect(Reconnect))
             },
             GatewayOpCode::InvalidSession => {
-                serde_json::from_value(raw.d)
+                serde_json::from_value(raw.d.clone())
                     .map(GatewayRecvEvent::InvalidSession)
-                    .map_err(|e| e.into())
+                    .map_err(|e| Into::<BetterSerdeError>::into((e,&raw.d)).into())
             },
             GatewayOpCode::Dispatch => {
                 let event_name = raw.t
@@ -79,11 +82,15 @@ impl TryFrom<RawGatewayPayload> for GatewayIncoming<WithSequenceNumber<GatewayRe
 
                 match event_name {
                     DispatchEvent::Ready => {
-                        serde_json::from_value(raw.d)
+                        serde_json::from_value(raw.d.clone())
                             .map(GatewayRecvEvent::Ready)
-                            .map_err(|e| e.into())
+                            .map_err(|e| Into::<BetterSerdeError>::into((e, &raw.d)).into())
                     },
-                    _ => panic!("Dispatch event not implemented yet: {:?}", event_name),
+                    _ => {
+                        serde_json::from_value(raw.d.clone())
+                            .map(GatewayRecvEvent::Dispatch)
+                            .map_err(|e| Into::<BetterSerdeError>::into((e, &raw.d)).into())
+                    },
                 }
 
 
@@ -116,7 +123,7 @@ pub struct Ready {
     pub shard: Option<(u32, u32)>,
     pub application: Option<ApplicationInfo>,
     #[serde(default)]
-    pub guilds: Vec<Guild>,
+    pub guilds: Vec<UnavailableGuild>,
 }
 
 // Supporting types:
@@ -140,14 +147,34 @@ pub struct ApplicationInfo {
     // Add other fields as needed
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]
-pub struct Guild {
-    pub id: String,
-    pub name: String,
-    pub icon: Option<String>,
-    pub owner: Option<bool>,
-    pub permissions: Option<String>,
-    // Add other guild fields as needed
+#[derive(Debug, Clone, PartialEq)]
+pub enum GuildCreateEvent {
+    UnavailableGuild(UnavailableGuild),
+    GuildCreate(GuildCreate),
+}
+
+impl<'de> Deserialize<'de> for GuildCreateEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        if value.get("unavailable")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            Ok(GuildCreateEvent::UnavailableGuild(
+                serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?,
+            ))
+        } else {
+            Ok(GuildCreateEvent::GuildCreate(
+                serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?,
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, PartialOrd)]

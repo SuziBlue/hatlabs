@@ -1,20 +1,24 @@
 
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::{task::Poll, time::Duration};
 
 use either::Either;
+use futures::lock::Mutex;
 use futures::{ready, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use oozebot_protocol::close_codes::GatewayCloseEvent;
-use oozebot_protocol::events::receive::{self, GatewayIncoming, GatewayRecvEvent};
+use oozebot_protocol::events::receive::{self, GatewayIncoming, GatewayRecvEvent, GuildCreateEvent };
 use oozebot_protocol::events::send::{self, ClientProperties, GatewayOutgoing, GatewaySendEvent, Identify};
 use oozebot_protocol::intents::Intents;
-use oozebot_protocol::{GatewayError, HeartbeatError, RawGatewayPayload, WithSequenceNumber};
+use oozebot_protocol::resources::guild::{Guild, GuildCreate};
+use oozebot_protocol::{BetterSerdeError, GatewayError, HeartbeatError, RawGatewayPayload, WithSequenceNumber};
 use pin_project_lite::pin_project;
 use tokio::net::TcpStream;
 use tokio::time::{interval, Interval};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::info;
 
@@ -71,29 +75,35 @@ pub async fn connect_websocket(url: &str) -> WebSocketConnection
     ws_connection
 }
 
-pub type GatewayConnectionConnected = Duplex<
+pub type ConnectionDecoded = Duplex<
     Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, 
     Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>,
 >;
 
-trait CreateConnection<E>: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Sized + 'static 
+trait DecodeConnection<E>: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Sized + 'static 
 where 
     GatewayError: From<E>,
 {
-    async fn create_connection(
-        self, 
-    ) -> GatewayConnectionConnected
-    {
+    fn decode_connection(
+        self,
+    ) -> ConnectionDecoded;
+}
 
+impl<Connection> DecodeConnection<tokio_tungstenite::tungstenite::Error> for Connection 
+where 
+    Connection: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + 'static,
+{
+    fn decode_connection(
+            self,
+        ) -> ConnectionDecoded {
+        
         let (outgoing, incoming) = self.split();
 
-        let mut decoded = Box::pin(incoming.map(|msg| {
+        let decoded = Box::pin(incoming.map(|msg| {
             match msg {
                 Ok(Message::Text(text)) => {
-                    info!(target: "gateway.recv", json = %text, "received gateway message");
-
                     return serde_json::from_str::<RawGatewayPayload>(&text)        
-                        .map_err(Into::into)
+                        .map_err(|e| <(serde_json::Error, &str) as Into::<BetterSerdeError>>::into((e, &text.to_string())).into())
                         .and_then(TryInto::try_into)
                 },
                 Ok(Message::Close(maybe_frame)) => {
@@ -104,6 +114,34 @@ where
                 Err(e) => return Err(Into::<GatewayError>::into(e))
             };
         }));
+
+        let encoded = Box::pin(outgoing.with(|event: GatewayOutgoing| async move {
+            let msg: Message = event.into();
+
+            Ok(msg)
+        }));
+
+        return Duplex::new(encoded, decoded)
+    }
+}
+
+
+pub type GatewayConnectionConnected = Duplex<
+    Pin<Box<dyn Sink<GatewayOutgoing, Error = GatewayError>>>, 
+    Pin<Box<dyn Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>>>>,
+>;
+
+trait CreateConnection: 
+    Sink<GatewayOutgoing, Error = GatewayError> + 
+    Stream<Item = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>> + 
+    Sized + 
+    'static 
+{
+    async fn create_connection(
+        self, 
+    ) -> GatewayConnectionConnected
+    {
+        let (encoded, mut decoded) = self.split();
 
         let hello = match decoded.next().await
             .expect("Websocket should not close")
@@ -120,26 +158,6 @@ where
 
         let heartbeat_interval = hello.heartbeat_interval;
 
-
-        let encoded = Box::pin(outgoing.with(|event: GatewayOutgoing| async move {
-            let msg: Message = event.into();
-
-            match &msg {
-                Message::Text(text) => {
-                    info!(json = %text, "sending websocket text message");
-                }
-                Message::Close(frame) => {
-                    info!(?frame, "sending websocket close");
-                }
-                _ => {
-                    info!(kind = ?msg, "sending websocket control frame");
-                }
-            }
-
-            Ok(msg)
-        }));
-
-
         let fan_in_encoded = FanInSink::new(encoded);
 
         let heartbeat_sink = fan_in_encoded.clone();
@@ -150,7 +168,7 @@ where
     }
 }
 
-impl CreateConnection<tungstenite::error::Error> for WebSocketConnection {}
+impl CreateConnection for ConnectionDecoded {}
 
 pub async fn resume_connection(
     resume_gateway_url: &str, 
@@ -166,7 +184,10 @@ pub async fn resume_connection(
 
     let (ws_connection, _response) = tokio_tungstenite::connect_async(request).await.unwrap();
 
-    let mut connection = ws_connection.create_connection().await;
+    let mut connection = ws_connection
+        .decode_connection()
+        .create_connection()
+        .await;
 
 
 
@@ -193,7 +214,7 @@ trait IdentifyGatewayConnection<E>:
 where 
     E: std::fmt:: Debug,
 {
-    async fn identify_gateway_connection(mut self, token: &str) -> GatewayConnectionIdentified<Self>
+    async fn identify_gateway_connection(mut self, token: &str, intents: Intents) -> GatewayConnectionIdentified<Self>
     {
 
         let identify = Identify {
@@ -207,7 +228,7 @@ where
             large_threshold: None,
             shard: None,
             presence: None,
-            intents: Intents::GUILDS.bits(),
+            intents: intents.bits(),
         };
 
         self.send(GatewayOutgoing::Send(GatewaySendEvent::Identify(identify))).await.unwrap();
@@ -508,13 +529,13 @@ impl TestHarnessBuilder {
 }
 
 
-impl<St, Si, Fut1, F1, Fut2, F2> CreateConnection<tokio_tungstenite::tungstenite::Error> for TestHarness<St, Si, Message, Fut1, F1, Fut2, F2> 
+impl<St, Si, Fut1, F1, Fut2, F2> CreateConnection for TestHarness<St, Si, GatewayOutgoing, Fut1, F1, Fut2, F2> 
 where 
     St: Stream + 'static,
-    Si: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + 'static,
-    Fut1: Future<Output = Result<Message, tokio_tungstenite::tungstenite::Error>> + 'static,
-    Fut2: Future<Output = Result<Message, tokio_tungstenite::tungstenite::Error>> + 'static,
-    F1: FnMut(Message) -> Fut1 + 'static,
+    Si: Sink<GatewayOutgoing, Error = GatewayError> + 'static,
+    Fut1: Future<Output = Result<GatewayOutgoing, GatewayError>> + 'static,
+    Fut2: Future<Output = Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>> + 'static,
+    F1: FnMut(GatewayOutgoing) -> Fut1 + 'static,
     F2: FnMut(St::Item) -> Fut2 + 'static,
 
 {}
@@ -536,6 +557,8 @@ async fn connect_to_gateway() {
         .as_str().unwrap()
         .to_string();
 
+    let gateway_url = format!("{}/?v=10", gateway_url);
+
     dotenvy::dotenv().unwrap();
     let token: &str = &std::env::var("GATEWAY_TOKEN").expect("Could not find token.");
 
@@ -543,12 +566,62 @@ async fn connect_to_gateway() {
         .await
         .split();
 
-    let test_outgoing = |msg: Message| async {
+    let print_outgoing = |msg: Message| async {
+        match &msg {
+            Message::Text(text) => {
+                let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+                println!("Sending JSON value: {:#?}", raw);
+            },
+            _ => {}
+        }
         Ok(msg)
     };
 
-    let test_incoming = |msg: Result<Message, tokio_tungstenite::tungstenite::Error>| async {
+    let print_incoming = |msg: Result<Message, tokio_tungstenite::tungstenite::Error>| async {
+        match &msg {
+            Ok(Message::Text(text)) => {
+                let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+                println!("Received JSON value: {:#?}", raw);
+            },
+            _ => {}
+        }
         msg
+    };
+
+    let (ws_sink, ws_stream) = TestHarnessBuilder::new(
+        print_outgoing, 
+        print_incoming, 
+        ws_sink, 
+        ws_stream
+    )
+        .decode_connection()
+        .split();
+
+    let test_outgoing = |msg: GatewayOutgoing| async {
+        info!("Sending message {:?}", msg);
+        Ok(msg)
+    };
+
+    let (interval_tx, interval_rx) = tokio::sync::oneshot::channel();
+    let mut interval_tx = Some(interval_tx);
+
+    let test_incoming = move |msg: Result<GatewayIncoming<WithSequenceNumber<GatewayRecvEvent>, GatewayCloseEvent>, GatewayError>| {
+        let interval_tx = interval_tx.take();
+        async move {
+            match &msg {
+                Ok(GatewayIncoming::Recv(WithSequenceNumber{
+                    inner: GatewayRecvEvent::Hello(hello),
+                    ..
+                })) => {
+                    info!("Interval received.");
+                    let _ = interval_tx.unwrap().send(Some(hello.heartbeat_interval));
+                }
+                _ => {
+                    info!("Received message '{:?}'", msg);
+                }
+            }
+            msg
+        }
     };
 
     let test_harness = TestHarnessBuilder::new(
@@ -558,17 +631,108 @@ async fn connect_to_gateway() {
         ws_stream
     );
 
+    let intents = Intents::GUILDS;
+
     let mut connection = test_harness 
         .create_connection()
         .await
-        .identify_gateway_connection(token)
+        .identify_gateway_connection(token, intents)
         .await;
 
     println!("Connection established");
 
-    connection.close().await.expect("Failed to close connection");
+    println!("Waiting for heartbeat interval to arrive");
 
-    println!("Connection closed");
+    let interval = interval_rx.await.unwrap().unwrap();
+
+    println!("Interval arrived. Waiting {:?} ms", interval);
+
+    // Spawn heartbeat loop
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(interval));
+
+    heartbeat_interval.reset();
+
+    loop {
+        tokio::select! {
+            // Heartbeat tick
+            _ = heartbeat_interval.tick() => {
+                println!("Interval has passed. Closing connection.");
+
+                connection.close().await.expect("Failed to close connection");
+
+                println!("Connection closed");
+            }
+
+            // Incoming message
+            msg = connection.next() => {
+                match msg {
+                    Some(Ok(_)) => {
+                        match msg {
+                            Some(Ok(GatewayRecvEvent::Dispatch(value))) => {
+                                let guild: GuildCreate = serde_json::from_value(value).unwrap();
+                                let channel = &guild.channels[2];
+                                let channel_id = &channel.id;
+                                println!("The channel id is: {:?}", channel_id);
+                                println!("Sending test message");
+
+
+
+                                // Discord API URL for sending messages
+                                let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_id);
+
+                                #[derive(serde::Serialize, Debug)]
+                                struct Message {
+                                    content: String,
+                                }
+
+                                // Message to send
+                                let message = Message {
+                                    content: "Hello, world!".to_string(),
+                                };
+
+                                // Create the HTTP client
+                                let client = reqwest::Client::new();
+
+                                println!("Sending message: {:?}", message);
+
+                                // Send the POST request
+                                let response = client
+                                    .post(url)
+                                    .header("Authorization", format!("Bot {}", token))
+                                    .json(&message)
+                                    .send()
+                                    .await;
+
+                                match response {
+                                    Ok(res) => {
+                                        if res.status().is_success() {
+                                            println!("Message sent successfully!");
+                                        } else {
+                                            // Print the response body to get more details on the error
+                                            let status = res.status();
+                                            let body = res.text().await.unwrap_or_else(|_| String::from("Failed to read response body"));
+                                            println!("Failed to send message: {} - Response body: {}", status, body);
+                                        }
+                                    }
+                                    Err(e) => println!("Error sending request: {}", e),
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                    None => {
+                        println!("Socket closed by server");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        println!("Socket closed with error");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 

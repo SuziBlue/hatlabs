@@ -20,7 +20,7 @@ pub struct WidgetMember {
     #[serde(rename = "discriminator", deserialize_with = "Option::deserialize")]
     pub discriminator: Option<String>,
     #[serde(rename = "avatar", skip_serializing_if = "Option::is_none")]
-    pub avatar: Option<models::Null>,
+    pub avatar: Option<()>,
     #[serde(rename = "status")]
     pub status: String,
     #[serde(rename = "avatar_url")]
